@@ -1,7 +1,7 @@
 import { connect } from 'cloudflare:sockets';
 
 // --- 硬编码配置 ---
-const authToken = 'f64bdc57-0f54-4705-bf75-cfd646d98c06';
+const authToken = 'a89316bd-1539-45dc-bee4-266fc60a0f2b';
 let fallbackAddress = '';
 const socks5Config = '';
 // 手动指定地区（留空则自动检测，可选值：US、SG、JP、HK、KR、DE、SE、NL、FI、GB）
@@ -11,25 +11,23 @@ const customPath = '';
 // GitHub订阅URL（硬编码）
 const githubPreferredURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
 // 启用GitHub优选IP（true启用，false禁用）
-const enableGitHubPreferred = true;
+const enableGitHubPreferred = false;
 // 启用其他优选（域名优选，true启用，false禁用）
 const enableOtherPreferred = true;
 // API地址配置（订阅转换服务）
 const apiBaseUrl = 'https://url.v1.mk/sub';
 
 const directDomains = [
-  { name: "cloudflare.182682.xyz", domain: "cloudflare.182682.xyz" },
-  { name: "speed.marisalnc.com", domain: "speed.marisalnc.com" },
-  { domain: "freeyx.cloudflare88.eu.org" }, { domain: "bestcf.top" },
-  { domain: "cdn.2020111.xyz" }, { domain: "cfip.cfcdn.vip" },
-  { domain: "cf.0sm.com" }, { domain: "cf.090227.xyz" },
-  { domain: "cf.zhetengsha.eu.org" }, { domain: "cloudflare.9jy.cc" },
-  { domain: "cf.zerone-cdn.pp.ua" }, { domain: "cfip.1323123.xyz" },
-  { domain: "cnamefuckxxs.yuchen.icu" }, { domain: "cloudflare-ip.mofashi.ltd" },
-  { domain: "115155.xyz" }, { domain: "cname.xirancdn.us" },
-  { domain: "f3058171cad.002404.xyz" }, { domain: "8.889288.xyz" },
-  { domain: "cdn.tzpro.xyz" }, { domain: "cf.877771.xyz" },
-  { domain: "xn--b6gac.eu.org" }
+  { name: "香港", domain: "hk.cle.us.ci" }, 
+  { name: "日本", domain: "jp.cle.us.ci" }, 
+  { name: "韩国", domain: "kr.cle.us.ci" }, 
+  { name: "新加坡", domain: "sg.cle.us.ci" }, 
+  { name: "美国", domain: "us.cle.us.ci" }, 
+  { name: "香港", domain: "hk443.018881.xyz" }, 
+  { name: "日本", domain: "jp443.018881.xyz" }, 
+  { name: "韩国", domain: "kr443.018881.xyz" }, 
+  { name: "新加坡", domain: "sg443.018881.xyz" }, 
+  { name: "美国", domain: "us443.018881.xyz" }
 ];
 
 const parsedSocks5Config = {};
