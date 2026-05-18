@@ -41,7 +41,8 @@ jobs:
           // 定义多文件映射关系
           const filesToProcess = [
             { source: 'cfnew.js', output: 'cfnew_worker.js' },
-            { source: 'edgetunnel.js', output: 'edgetunnel_worker.js' }
+            { source: 'edgetunnel.js', output: 'edgetunnel_worker.js' },
+            { source: 'snippets.js', output: 'snippets_worker.js' }
           ];
 
           const obfuscationOptions = {
