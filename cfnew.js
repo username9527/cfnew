@@ -1,5 +1,5 @@
-    // CFnew - 终端 v2.9.7 
-    // 版本: v2.9.7 
+    // CFnew - 终端 v2.9.8
+    // 版本: v2.9.8 
     import { connect } from 'cloudflare:sockets';
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
     let fallbackAddress = '';
@@ -22,11 +22,12 @@
     // 启用ECH功能（true启用，false禁用）
     let enableECH = true;  
     // 自定义DNS服务器（默认：https://223.5.5.5/dns-query）
-    let customDNS = 'https://223.5.5.5/dns-query';
+    let customDNS = 'https://146.112.41.2/dns-query';
     // 自定义ECH域名（默认：cloudflare-ech.com）
     let customECHDomain = 'cloudflare-ech.com';
+    let customALPN = '';
 
-    let scu = 'https://api.wcc.best/sub';  
+    let scu = 'https://url.v1.mk/sub';  
     // 远程配置URL（硬编码）
     const remoteConfigUrl = 'https://raw.githubusercontent.com/byJoey/test/refs/heads/main/tist.ini';
 
@@ -38,7 +39,8 @@
     let kvStore = null;
     let kvConfig = {};
     let kvConfigLastLoad = 0;
-    const KV_CACHE_TTL = 5 * 60 * 60 * 1000; // 5小时缓存
+    const KV_CACHE_TTL = 30 * 1000; // 30秒缓存（短窗口内跳过版本检查）
+    let kvConfigVersion = '';
 
     const regionMapping = {
         'HK': ['🇭🇰 香港', 'HK', 'Hong Kong'],
@@ -105,6 +107,16 @@
     const ADDRESS_TYPE_IPV4 = 1;
     const ADDRESS_TYPE_URL = 2;
     const ADDRESS_TYPE_IPV6 = 3;
+    const TRANSPORT_CHUNK_SIZE = 64 * 1024;
+    const TRANSPORT_DN_PACK = 32 * 1024;
+    const TRANSPORT_DN_TAIL = 512;
+    const TRANSPORT_DN_DELAY = 0;
+    const TRANSPORT_UP_PACK = 16 * 1024;
+    const TRANSPORT_UP_Q_MAX = 256 * 1024;
+    const TRANSPORT_CONNECT_RACE = 2;
+    const FIRST_BYTE_TIMEOUT = 3500;
+    const sharedDecoder = new TextDecoder();
+    const uuidByteCache = new Map();
 
 	function isValidFormat(str) {
         const userRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -149,6 +161,52 @@
         return { namer, setSkipNumbering };
     }
 
+    function normalizeNodeHost(host) {
+        return String(host || '').trim().replace(/^\[([^\]]+)\]$/, '$1');
+    }
+
+    function compactNodeAliasPart(value, fallback = 'Node') {
+        let text = String(value || '').trim();
+        if (!text || /^自定义优选-/i.test(text)) text = fallback;
+        text = text
+            .replace(/^\[([^\]]+)\]$/, '$1')
+            .replace(/^https?:\/\//i, '')
+            .replace(/[/?#].*$/, '')
+            .replace(/\s+/g, '_');
+        return text || fallback;
+    }
+
+    function getCompactNodeAliasBase(item) {
+        const host = normalizeNodeHost(item?.ip || item?.domain || '');
+        if (host && host.includes(':') && /^[0-9a-fA-F:.]+$/.test(host)) return 'IPv6优选';
+        if (host && !isValidIP(host)) return '优选域名';
+
+        const isp = compactNodeAliasPart(item?.isp || item?.name || '', 'IPv4优选');
+        const colo = compactNodeAliasPart(item?.colo || '', '');
+        return colo ? `${isp}-${colo}` : isp;
+    }
+
+    function createCompactNodeNamer(skipNumbering = false) {
+        const counters = {};
+        return (item) => {
+            const base = getCompactNodeAliasBase(item);
+            if (skipNumbering) return base;
+            counters[base] = (counters[base] || 0) + 1;
+            return `${base}-${String(counters[base]).padStart(2, '0')}`;
+        };
+    }
+
+    function normalizeALPN(value) {
+        const allowed = ['', 'h3', 'h2', 'http/1.1', 'h3,h2', 'h2,http/1.1', 'h3,h2,http/1.1'];
+        const alpn = String(value || '').trim();
+        return allowed.includes(alpn) ? alpn : '';
+    }
+
+    function applyALPNParam(params) {
+        const alpn = normalizeALPN(customALPN);
+        if (alpn) params.set('alpn', alpn);
+    }
+
     async function initKVStore(env) {
         if (env.C) {
             try {
@@ -166,19 +224,31 @@
             return;
         }
 
+        // 短窗口内完全信任缓存，避免高频请求时打爆 KV
         if (!force && kvConfigLastLoad > 0 && (Date.now() - kvConfigLastLoad) < KV_CACHE_TTL) {
             return;
         }
 
         try {
+            // 读取小体积的版本键 c_ver（约 13B），用于跨 isolate 缓存失效
+            let ver = '';
+            try { ver = (await kvStore.get('c_ver')) || ''; } catch (_) {}
+
+            // 版本未变化且已有缓存，仅刷新时间戳，跳过完整读取
+            if (!force && ver && ver === kvConfigVersion && kvConfig && Object.keys(kvConfig).length > 0) {
+                kvConfigLastLoad = Date.now();
+                return;
+            }
+
             const configData = await kvStore.get('c');
             if (configData) {
                 kvConfig = JSON.parse(configData);
-            } else {
             }
+            kvConfigVersion = ver;
             kvConfigLastLoad = Date.now();
         } catch (error) {
-            kvConfig = {};
+            // 读取失败时保留现有缓存，避免临时故障导致配置丢失
+            if (!kvConfig) kvConfig = {};
         }
     }
 
@@ -190,6 +260,10 @@
         try {
             const configString = JSON.stringify(kvConfig);
             await kvStore.put('c', configString);
+            // 写入版本号，让其它 isolate 在下次请求时能立即看到变更
+            const newVer = String(Date.now());
+            kvConfigVersion = newVer;
+            try { await kvStore.put('c_ver', newVer); } catch (_) {}
             kvConfigLastLoad = Date.now();
         } catch (error) {
             throw error; 
@@ -469,7 +543,7 @@
                     ex = xhttpControl === 'yes' || xhttpControl === true || xhttpControl === 'true';
                 }
 
-                scu = getConfigValue('scu', env.scu) || 'https://api.wcc.best/sub';
+                scu = getConfigValue('scu', env.scu) || 'https://url.v1.mk/sub';
 
                 const preferredDomainsControl = getConfigValue('epd', env.epd || 'no');
                 if (preferredDomainsControl !== undefined && preferredDomainsControl !== '') {
@@ -506,6 +580,8 @@
                 if (customECHDomainValue && customECHDomainValue.trim()) {
                     customECHDomain = customECHDomainValue.trim();
                 }
+
+                customALPN = normalizeALPN(getConfigValue('alpn', env.alpn || env.ALPN || ''));
 
                 // 如果启用了ECH，自动启用仅TLS模式（避免80端口干扰）
                 // ECH需要TLS才能工作，所以必须禁用非TLS节点
@@ -787,8 +863,8 @@
                             
                         const translations = {
                             zh: {
-                                title: '终端',
-                                terminal: '终端',
+                                title: '终端 v2.9.8',
+                                terminal: '终端 v2.9.8',
                                 congratulations: '恭喜你来到这',
                                 enterU: '请输入你U变量的值',
                                 enterD: '请输入你D变量的值',
@@ -804,8 +880,8 @@
                                  reenter: '请重新输入有效的UUID'
                             },
                             fa: {
-                                title: 'ترمینال',
-                                terminal: 'ترمینال',
+                                title: 'ترمینال v2.9.8',
+                                terminal: 'ترمینال v2.9.8',
                                 congratulations: 'تبریک می‌گوییم به شما',
                                 enterU: 'لطفا مقدار متغیر U خود را وارد کنید',
                                 enterD: 'لطفا مقدار متغیر D خود را وارد کنید',
@@ -1068,6 +1144,42 @@
             }
             #languageSelector option { background: var(--cp-bg-2); color: var(--cp-cyan); }
 
+            /* FX toggle - 页面特效图形化开关 */
+            .cp-fx-toggle {
+                position: fixed; top: 68px; left: 22px; z-index: 1001;
+                background: rgba(8,4,28,0.85);
+                border: 1px solid var(--cp-mint);
+                color: var(--cp-mint);
+                padding: 6px 12px;
+                font-family: inherit;
+                font-size: 11px;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+                cursor: pointer;
+                text-shadow: 0 0 6px var(--cp-mint);
+                box-shadow: 0 0 10px rgba(0,255,157,0.35);
+                clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px);
+                transition: all 0.2s ease;
+                display: inline-flex; align-items: center; gap: 6px;
+            }
+            .cp-fx-toggle:hover { color: var(--cp-pink); border-color: var(--cp-pink); text-shadow: 0 0 8px var(--cp-pink); box-shadow: 0 0 16px rgba(255,43,214,0.55); }
+            .cp-fx-toggle .cp-fx-dot { width: 6px; height: 6px; background: var(--cp-mint); border-radius: 50%; box-shadow: 0 0 8px var(--cp-mint); transition: all 0.2s; }
+            body.fx-off .cp-fx-toggle { color: var(--cp-text-dim); border-color: var(--cp-text-dim); text-shadow: none; box-shadow: none; }
+            body.fx-off .cp-fx-toggle .cp-fx-dot { background: transparent; border: 1px solid var(--cp-text-dim); box-shadow: none; }
+            body.fx-off .matrix-bg,
+            body.fx-off .matrix-code-rain,
+            body.fx-off .matrix-column { display: none !important; }
+            body.fx-off::before,
+            body.fx-off::after { display: none !important; content: none !important; }
+            body.fx-off { background: var(--cp-bg) !important; }
+            body.fx-off * {
+                animation: none !important;
+                transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s !important;
+            }
+            body.fx-off .cp-glitch::before,
+            body.fx-off .cp-glitch::after { display: none !important; }
+            body.fx-off .terminal-cursor::after { animation: none !important; }
+
             .cp-glitch {
                 font-family: "JetBrains Mono", monospace;
                 font-weight: 700;
@@ -1096,6 +1208,10 @@
                     <option value="fa" ${isFarsi ? 'selected' : ''}>🇮🇷 فارسی</option>
                 </select>
             </div>
+            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="cpToggleFx()" title="${isFarsi ? 'تغییر افکت‌های صفحه' : '切换页面特效'}" aria-label="FX toggle">
+                <span class="cp-fx-dot" aria-hidden="true"></span>
+                <span id="cpFxLabel">FX: ON</span>
+            </button>
         <div class="terminal">
             <div class="terminal-header">
                 <div class="terminal-buttons">
@@ -1126,7 +1242,36 @@
             </div>
         </div>
         <script>
+            // 页面特效图形化开关 (localStorage 持久化)
+            window.cpApplyFx = function() {
+                var off = localStorage.getItem('cp-fx-off') === '1';
+                document.body.classList.toggle('fx-off', off);
+                var lbl = document.getElementById('cpFxLabel');
+                if (lbl) lbl.textContent = off ? 'FX: OFF' : 'FX: ON';
+                if (off) {
+                    var rain = document.getElementById('matrixCodeRain');
+                    if (rain) rain.innerHTML = '';
+                } else if (typeof createMatrixRain === 'function') {
+                    var r = document.getElementById('matrixCodeRain');
+                    if (r && !r.firstChild) createMatrixRain();
+                }
+            };
+            window.cpToggleFx = function() {
+                var off = localStorage.getItem('cp-fx-off') === '1';
+                localStorage.setItem('cp-fx-off', off ? '0' : '1');
+                window.cpApplyFx();
+            };
+            (function() {
+                if (localStorage.getItem('cp-fx-off') === '1') {
+                    document.documentElement.classList.add('fx-off-preload');
+                    document.addEventListener('DOMContentLoaded', function() {
+                        document.body.classList.add('fx-off');
+                    });
+                }
+            })();
+
             function createMatrixRain() {
+                if (document.body && document.body.classList.contains('fx-off')) return;
                 const matrixContainer = document.getElementById('matrixCodeRain');
                 if (!matrixContainer) return;
                 const cyberChars = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ$%#@!?<>+=ABCDEF';
@@ -1410,7 +1555,7 @@
                 const path = params.get('path') || '/?ed=2048';
                 const host = params.get('host') || server;
                 const servername = params.get('sni') || host;
-                const alpn = params.get('alpn') || 'h3';
+                const alpnRaw = params.get('alpn') || '';
                 const fingerprint = params.get('fp') || params.get('client-fingerprint') || 'chrome';
                 const ech = params.get('ech');
 
@@ -1427,7 +1572,7 @@
 
                 if (tls) {
                     node.servername = servername;
-                    node.alpn = alpn.split(',').map(a => a.trim());
+                    if (alpnRaw) node.alpn = alpnRaw.split(',').map(a => a.trim()).filter(Boolean);
                     node['skip-cert-verify'] = false;
                 }
 
@@ -1464,7 +1609,7 @@
                 const path = params.get('path') || '/?ed=2048';
                 const host = params.get('host') || server;
                 const sni = params.get('sni') || host;
-                const alpn = params.get('alpn') || 'h3';
+                const alpnRaw = params.get('alpn') || '';
                 const ech = params.get('ech');
 
                 const node = {
@@ -1475,9 +1620,9 @@
                     password: password,
                     network: network,
                     sni: sni,
-                    alpn: alpn.split(',').map(a => a.trim()),
                     'skip-cert-verify': false
                 };
+                if (alpnRaw) node.alpn = alpnRaw.split(',').map(a => a.trim()).filter(Boolean);
 
                 if (network === 'ws') {
                     node['ws-opts'] = {
@@ -1504,69 +1649,792 @@
         return null;
     }
 
-    // 生成 Clash 配置
-    async function generateClashConfig(links, request, user) {
-        // 先通过订阅转换服务获取 Clash 配置
-        const subscriptionUrl = new URL(request.url);
-        subscriptionUrl.pathname = subscriptionUrl.pathname.replace(/\/sub$/, '') + '/sub';
-        subscriptionUrl.searchParams.set('target', 'base64');
-        const encodedUrl = encodeURIComponent(subscriptionUrl.toString());
-        const converterUrl = `${scu}?target=clash&url=${encodedUrl}&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true`;
+    // ============================================================
+    // 内部订阅转换器 - 不依赖外部 sub-converter
+    // ============================================================
 
-        try {
-            const response = await fetch(converterUrl);
-            if (!response.ok) {
-                throw new Error('订阅转换服务失败');
-            }
-
-            let clashConfig = await response.text();
-
-            // 如果 ECH 开启，为所有节点添加 ECH 参数
-            if (enableECH) {
-                // 处理单行格式的节点：  - {name: ..., server: ..., ...}
-                // 需要正确处理嵌套的花括号（如 ws-opts: {path: "...", headers: {Host: ...}}）
-                clashConfig = clashConfig.split('\n').map(line => {
-                    // 检查是否是节点行（以 "  - {" 开头，且包含 name: 和 server:）
-                    if (/^\s*-\s*\{/.test(line) && line.includes('name:') && line.includes('server:')) {
-                        // 检查是否已经有 ech-opts
-                        if (line.includes('ech-opts')) {
-                            return line; // 已有 ech-opts，不修改
-                        }
-                        // 找到最后一个 } 的位置（从右往左查找，处理嵌套花括号）
-                        const lastBraceIndex = line.lastIndexOf('}');
-                        if (lastBraceIndex > 0) {
-                            // 检查最后一个 } 之前是否有内容，确保格式正确
-                            const beforeBrace = line.substring(0, lastBraceIndex).trim();
-                            if (beforeBrace.length > 0) {
-                                // 在最后一个 } 之前添加 , ech-opts: {enable: true, query-server-name: ...}
-                                // 确保在逗号前有空格
-                                const echDomain = customECHDomain || 'cloudflare-ech.com';
-                                const needsComma = !beforeBrace.endsWith(',') && !beforeBrace.endsWith('{');
-                                return line.substring(0, lastBraceIndex) + (needsComma ? ', ' : ' ') + `ech-opts: {enable: true, query-server-name: ${echDomain}}` + line.substring(lastBraceIndex);
-                            }
-                        }
-                    }
-                    return line;
-                }).join('\n');
-
-                // 处理多行格式的节点（如果存在）
-                // 只处理单行格式，多行格式由订阅转换服务处理，不需要额外修改
-                // 如果订阅转换服务返回多行格式，通常已经是正确的格式
-            }
-
-            // 替换 DNS nameserver 为阿里的加密 DNS
-            clashConfig = clashConfig.replace(/^(\s*nameserver:\s*\n)((?:\s*-\s*[^\n]+\n)*)/m, (match, header, items) => {
-                // 替换所有 nameserver 项为阿里的加密 DNS
-                const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
-                return header + `    - ${dnsServer}\n`;
-            });
-
-            return clashConfig;
-        } catch (e) {
-            // 如果订阅转换失败，返回错误
-            throw new Error('无法获取 Clash 配置: ' + e.message);
-        }
+    // 用于 YAML 引号包裹（避免 IPv6 方括号、逗号等被解析为数组）
+    function yq(v) {
+        if (v == null) return '""';
+        const s = String(v);
+        return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
     }
+
+    // URL.hostname 对 IPv6 会带方括号，直接写入 YAML 会被当成数组
+    function normalizeServerHost(hostname) {
+        if (!hostname) return hostname;
+        const h = String(hostname);
+        if (h.startsWith('[') && h.endsWith(']')) return h.slice(1, -1);
+        return h;
+    }
+
+    // Clash 策略组 proxies：策略组 + 全部节点（避免分组里只有「节点选择」没有具体节点）
+    function clashSelectProxies(names, opts = {}) {
+        const { directFirst = false, extraGroups = [] } = opts;
+        const nodeLines = names.length
+            ? names.map(n => `      - ${yq(n)}`).join('\n')
+            : '      - DIRECT';
+        const lines = [];
+        if (directFirst) {
+            lines.push('      - "🎯 全球直连"', '      - "🚀 节点选择"');
+        } else {
+            lines.push('      - "🚀 节点选择"', '      - "🎯 全球直连"');
+        }
+        for (const g of extraGroups) lines.push(`      - ${yq(g)}`);
+        lines.push(nodeLines);
+        return lines.join('\n');
+    }
+
+    // Surge / Loon 策略组列表：策略组 + 全部节点
+    function iniPolicyList(names, opts = {}) {
+        const { directFirst = false, extraGroups = [], compact = false } = opts;
+        const sep = compact ? ',' : ', ';
+        const list = names.length ? names.join(sep) : 'DIRECT';
+        const parts = [];
+        if (directFirst) parts.push('🎯 全球直连', '🚀 节点选择');
+        else parts.push('🚀 节点选择', '🎯 全球直连');
+        parts.push(...extraGroups);
+        if (names.length) parts.push(list);
+        return parts.join(sep);
+    }
+
+    // 解析任意分享链接为通用节点对象 (vless / trojan / vless-xhttp)
+    function parseShareLink(link) {
+        try {
+            if (link.startsWith('vless://')) {
+                const url = new URL(link);
+                const p = new URLSearchParams(url.search);
+                return {
+                    proto: 'vless',
+                    name: decodeURIComponent(url.hash.substring(1)) || (url.hostname + ':' + url.port),
+                    uuid: url.username,
+                    server: normalizeServerHost(url.hostname),
+                    port: parseInt(url.port) || 443,
+                    tls: p.get('security') === 'tls' || p.get('security') === 'reality',
+                    network: p.get('type') || 'ws',
+                    path: p.get('path') || '/?ed=2048',
+                    host: normalizeServerHost(p.get('host') || url.hostname),
+                    sni: normalizeServerHost(p.get('sni') || p.get('host') || url.hostname),
+                    alpn: (p.get('alpn') || '').split(',').map(s => s.trim()).filter(Boolean),
+                    fp: p.get('fp') || 'chrome',
+                    flow: p.get('flow') || '',
+                    encryption: p.get('encryption') || 'none',
+                    mode: p.get('mode') || '',
+                    ech: p.get('ech') || ''
+                };
+            }
+            if (link.startsWith('trojan://')) {
+                const url = new URL(link);
+                const p = new URLSearchParams(url.search);
+                return {
+                    proto: 'trojan',
+                    name: decodeURIComponent(url.hash.substring(1)) || (url.hostname + ':' + url.port),
+                    password: decodeURIComponent(url.username),
+                    server: normalizeServerHost(url.hostname),
+                    port: parseInt(url.port) || 443,
+                    tls: true,
+                    network: p.get('type') || 'ws',
+                    path: p.get('path') || '/?ed=2048',
+                    host: normalizeServerHost(p.get('host') || url.hostname),
+                    sni: normalizeServerHost(p.get('sni') || p.get('host') || url.hostname),
+                    alpn: (p.get('alpn') || '').split(',').map(s => s.trim()).filter(Boolean),
+                    fp: p.get('fp') || 'chrome',
+                    ech: p.get('ech') || ''
+                };
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    // 单个节点 → Clash 块级 YAML（避免 flow style 解析错误）
+    function buildClashNodeLine(n) {
+        const lines = [];
+        const server = normalizeServerHost(n.server);
+        const host = normalizeServerHost(n.host) || server;
+        const sni = normalizeServerHost(n.sni) || host;
+
+        lines.push(`  - name: ${yq(n.name)}`);
+        lines.push(`    type: ${n.proto}`);
+        lines.push(`    server: ${yq(server)}`);
+        lines.push(`    port: ${n.port}`);
+        if (n.proto === 'vless') {
+            lines.push(`    uuid: ${n.uuid}`);
+            lines.push(`    udp: true`);
+            lines.push(`    tls: ${n.tls ? 'true' : 'false'}`);
+            if (n.flow) lines.push(`    flow: ${yq(n.flow)}`);
+            lines.push(`    client-fingerprint: ${yq(n.fp || 'chrome')}`);
+        } else if (n.proto === 'trojan') {
+            lines.push(`    password: ${yq(n.password)}`);
+            lines.push(`    udp: true`);
+            lines.push(`    client-fingerprint: ${yq(n.fp || 'chrome')}`);
+        }
+        if (n.tls) {
+            lines.push(`    servername: ${yq(sni)}`);
+            if (n.alpn && n.alpn.length) {
+                lines.push(`    alpn: [${n.alpn.map(a => yq(a)).join(', ')}]`);
+            }
+            lines.push(`    skip-cert-verify: false`);
+        }
+        if (n.network === 'ws' || n.network === 'xhttp') {
+            lines.push(`    network: ws`);
+            lines.push(`    ws-opts:`);
+            lines.push(`      path: ${yq(n.path)}`);
+            lines.push(`      headers:`);
+            lines.push(`        Host: ${yq(host)}`);
+        } else if (n.network === 'grpc') {
+            lines.push(`    network: grpc`);
+            lines.push(`    grpc-opts:`);
+            lines.push(`      grpc-service-name: ${yq(n.path)}`);
+        }
+        if (n.ech) {
+            const echDomain = customECHDomain || 'cloudflare-ech.com';
+            lines.push(`    ech-opts:`);
+            lines.push(`      enable: true`);
+            lines.push(`      query-server-name: ${yq(echDomain)}`);
+        }
+        return lines.join('\n');
+    }
+
+    // 内部生成 Clash YAML（完整规则集：Loyalsoldier rule-providers）
+    function generateClashYaml(links, opts = {}) {
+        const nodes = links.map(parseShareLink).filter(n => n && (n.proto === 'vless' || n.proto === 'trojan'));
+        const names = nodes.map(n => n.name);
+        const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
+
+        const head = [
+            'mixed-port: 7890',
+            'allow-lan: true',
+            'mode: rule',
+            'log-level: info',
+            'ipv6: true',
+            'external-controller: 127.0.0.1:9090',
+            'unified-delay: true',
+            'tcp-concurrent: true',
+            'geodata-mode: true',
+            'geo-auto-update: true',
+            'geo-update-interval: 24',
+            'geox-url:',
+            '  geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"',
+            '  geosite: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"',
+            '  mmdb: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"',
+            '  asn: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"',
+            'sniffer:',
+            '  enable: true',
+            '  force-dns-mapping: true',
+            '  parse-pure-ip: true',
+            '  sniff:',
+            '    HTTP:',
+            '      ports: [80, 8080-8880]',
+            '      override-destination: true',
+            '    TLS:',
+            '      ports: [443, 8443]',
+            '    QUIC:',
+            '      ports: [443, 8443]',
+            'dns:',
+            '  enable: true',
+            '  listen: 0.0.0.0:1053',
+            '  ipv6: true',
+            '  enhanced-mode: fake-ip',
+            '  fake-ip-range: 198.18.0.1/16',
+            '  fake-ip-filter:',
+            '    - "*.lan"',
+            '    - "+.local"',
+            '    - "+.market.xiaomi.com"',
+            '    - "+.msftconnecttest.com"',
+            '    - "+.msftncsi.com"',
+            '    - "localhost.ptlogin2.qq.com"',
+            '    - "+.srv.nintendo.net"',
+            '    - "+.stun.playstation.net"',
+            '    - "+.xboxlive.com"',
+            '  default-nameserver:',
+            '    - 223.5.5.5',
+            '    - 119.29.29.29',
+            '  nameserver:',
+            `    - ${dnsServer}`,
+            '    - https://119.29.29.29/dns-query',
+            '  fallback:',
+            '    - https://1.1.1.1/dns-query',
+            '    - https://8.8.8.8/dns-query',
+            '  fallback-filter:',
+            '    geoip: true',
+            '    geoip-code: CN',
+            '    ipcidr:',
+            '      - 240.0.0.0/4',
+            ''
+        ];
+
+        const proxiesBlock = ['proxies:'];
+        for (const n of nodes) proxiesBlock.push(buildClashNodeLine(n));
+
+        const nodeOnly = names.length ? names.map(n => `      - ${yq(n)}`).join('\n') : '      - DIRECT';
+        const proxyGroups = [
+            'proxy-groups:',
+            '  - name: "🚀 节点选择"',
+            '    type: select',
+            '    proxies:',
+            '      - "🎯 全球直连"',
+            nodeOnly,
+            '  - name: "🌍 国外媒体"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names),
+            '  - name: "📺 哔哩哔哩"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names, { directFirst: true }),
+            '  - name: "📹 油管视频"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names, { extraGroups: ['🌍 国外媒体'] }),
+            '  - name: "🎬 奈飞视频"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names, { extraGroups: ['🌍 国外媒体'] }),
+            '  - name: "📲 电报信息"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names),
+            '  - name: "🌐 谷歌服务"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names),
+            '  - name: "🤖 OpenAI"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names),
+            '  - name: "Ⓜ️ 微软服务"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names, { directFirst: true }),
+            '  - name: "🍎 苹果服务"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names, { directFirst: true }),
+            '  - name: "🎯 全球直连"',
+            '    type: select',
+            '    proxies:',
+            '      - DIRECT',
+            '  - name: "🛑 全球拦截"',
+            '    type: select',
+            '    proxies:',
+            '      - REJECT',
+            '      - DIRECT',
+            '  - name: "🍃 应用净化"',
+            '    type: select',
+            '    proxies:',
+            '      - REJECT',
+            '      - DIRECT',
+            '  - name: "🐟 漏网之鱼"',
+            '    type: select',
+            '    proxies:',
+            clashSelectProxies(names),
+            ''
+        ];
+
+        // Loyalsoldier rule-providers (Clash 经典格式) - CDN: jsDelivr
+        const RP_BASE = 'https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release';
+        const provider = (name, behavior) => [
+            `  ${name}:`,
+            `    type: http`,
+            `    behavior: ${behavior}`,
+            `    url: "${RP_BASE}/${name}.txt"`,
+            `    path: ./rulesets/loyalsoldier/${name}.txt`,
+            `    interval: 86400`
+        ].join('\n');
+
+        const ruleProviders = [
+            'rule-providers:',
+            provider('reject', 'domain'),
+            provider('icloud', 'domain'),
+            provider('apple', 'domain'),
+            provider('google', 'domain'),
+            provider('proxy', 'domain'),
+            provider('direct', 'domain'),
+            provider('private', 'domain'),
+            provider('gfw', 'domain'),
+            provider('greatfire', 'domain'),
+            provider('tld-not-cn', 'domain'),
+            provider('telegramcidr', 'ipcidr'),
+            provider('cncidr', 'ipcidr'),
+            provider('lancidr', 'ipcidr'),
+            provider('applications', 'classical'),
+            ''
+        ];
+
+        const rules = [
+            'rules:',
+            '  - DOMAIN-SUFFIX,acl4.ssr,🎯 全球直连',
+            '  - DOMAIN-SUFFIX,local,🎯 全球直连',
+            '  - DOMAIN,clash.razord.top,🎯 全球直连',
+            '  - DOMAIN,yacd.haishan.me,🎯 全球直连',
+            '  - DOMAIN,yacd.metacubex.one,🎯 全球直连',
+            '  - DOMAIN,d.metacubex.one,🎯 全球直连',
+            '  - DOMAIN-SUFFIX,googleapis.cn,🌐 谷歌服务',
+            '  - DOMAIN-SUFFIX,gstatic.com,🌐 谷歌服务',
+            '  - DOMAIN-SUFFIX,xn--ngstr-lra8j.com,🌐 谷歌服务',
+            '  - DOMAIN-SUFFIX,googlevideo.com,📹 油管视频',
+            '  - DOMAIN-SUFFIX,googleusercontent.com,🌐 谷歌服务',
+            '  - DOMAIN-KEYWORD,youtube,📹 油管视频',
+            '  - DOMAIN-SUFFIX,youtube.com,📹 油管视频',
+            '  - DOMAIN-SUFFIX,youtu.be,📹 油管视频',
+            '  - DOMAIN-KEYWORD,netflix,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,nflxext.com,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,nflxso.net,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,nflxvideo.net,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,nflximg.com,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,nflximg.net,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,netflix.com,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,netflix.net,🎬 奈飞视频',
+            '  - DOMAIN-SUFFIX,bilibili.com,📺 哔哩哔哩',
+            '  - DOMAIN-SUFFIX,bilivideo.com,📺 哔哩哔哩',
+            '  - DOMAIN-SUFFIX,hdslb.com,📺 哔哩哔哩',
+            '  - DOMAIN-KEYWORD,openai,🤖 OpenAI',
+            '  - DOMAIN-KEYWORD,chatgpt,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,openai.com,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,chatgpt.com,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,oaistatic.com,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,oaiusercontent.com,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,anthropic.com,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,claude.ai,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,perplexity.ai,🤖 OpenAI',
+            '  - DOMAIN-SUFFIX,gemini.google.com,🤖 OpenAI',
+            '  - RULE-SET,applications,🎯 全球直连',
+            '  - RULE-SET,private,🎯 全球直连',
+            '  - RULE-SET,reject,🛑 全球拦截',
+            '  - RULE-SET,icloud,🍎 苹果服务',
+            '  - RULE-SET,apple,🍎 苹果服务',
+            '  - RULE-SET,google,🌐 谷歌服务',
+            '  - RULE-SET,proxy,🚀 节点选择',
+            '  - RULE-SET,gfw,🚀 节点选择',
+            '  - RULE-SET,greatfire,🚀 节点选择',
+            '  - RULE-SET,tld-not-cn,🚀 节点选择',
+            '  - RULE-SET,direct,🎯 全球直连',
+            '  - RULE-SET,lancidr,🎯 全球直连,no-resolve',
+            '  - RULE-SET,cncidr,🎯 全球直连,no-resolve',
+            '  - RULE-SET,telegramcidr,📲 电报信息,no-resolve',
+            '  - GEOIP,LAN,🎯 全球直连,no-resolve',
+            '  - GEOIP,CN,🎯 全球直连,no-resolve',
+            '  - MATCH,🐟 漏网之鱼'
+        ];
+
+        return [head.join('\n'), proxiesBlock.join('\n'), '', proxyGroups.join('\n'), ruleProviders.join('\n'), rules.join('\n'), ''].join('\n');
+    }
+
+    // 内部生成 Sing-box JSON 配置（完整规则集：MetaCubeX 镜像 rule-set）
+    function generateSingBoxJson(links) {
+        const nodes = links.map(parseShareLink).filter(n => n && (n.proto === 'vless' || n.proto === 'trojan'));
+        const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
+        const outboundTags = nodes.map(n => n.name);
+
+        function nodeToOutbound(n) {
+            const out = {
+                type: n.proto,
+                tag: n.name,
+                server: normalizeServerHost(n.server),
+                server_port: n.port
+            };
+            if (n.proto === 'vless') {
+                out.uuid = n.uuid;
+                if (n.flow) out.flow = n.flow;
+            } else {
+                out.password = n.password;
+            }
+            if (n.tls) {
+                out.tls = {
+                    enabled: true,
+                    server_name: n.sni,
+                    insecure: false,
+                    utls: { enabled: true, fingerprint: n.fp || 'chrome' }
+                };
+                if (n.alpn && n.alpn.length) out.tls.alpn = n.alpn;
+                if (n.ech) {
+                    out.tls.ech = { enabled: true, pq_signature_schemes_enabled: false, dynamic_record_sizing_disabled: false };
+                }
+            }
+            if (n.network === 'ws' || n.network === 'xhttp') {
+                out.transport = {
+                    type: 'ws',
+                    path: n.path,
+                    headers: { Host: n.host },
+                    max_early_data: 2048,
+                    early_data_header_name: 'Sec-WebSocket-Protocol'
+                };
+            } else if (n.network === 'grpc') {
+                out.transport = { type: 'grpc', service_name: n.path };
+            }
+            return out;
+        }
+
+        // sing-box rule-set 远端 SRS 文件（CDN：jsDelivr 镜像 MetaCubeX 转换的 SagerNet 数据）
+        const SRS_BASE_SITE = 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite';
+        const SRS_BASE_IP = 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip';
+        const siteRule = (tag) => ({ tag: `geosite-${tag}`, type: 'remote', format: 'binary', url: `${SRS_BASE_SITE}/${tag}.srs`, download_detour: 'direct' });
+        const ipRule = (tag) => ({ tag: `geoip-${tag}`, type: 'remote', format: 'binary', url: `${SRS_BASE_IP}/${tag}.srs`, download_detour: 'direct' });
+
+        const config = {
+            log: { level: 'info', timestamp: true },
+            dns: {
+                servers: [
+                    { tag: 'remote', address: dnsServer, detour: 'select' },
+                    { tag: 'local', address: '223.5.5.5', detour: 'direct' },
+                    { tag: 'fakeip', address: 'fakeip' },
+                    { tag: 'block', address: 'rcode://success' }
+                ],
+                rules: [
+                    { outbound: 'any', server: 'local' },
+                    { rule_set: 'geosite-category-ads-all', server: 'block' },
+                    { rule_set: 'geosite-cn', server: 'local' },
+                    { query_type: ['A', 'AAAA'], server: 'fakeip' }
+                ],
+                fakeip: { enabled: true, inet4_range: '198.18.0.0/15', inet6_range: 'fc00::/18' },
+                independent_cache: true,
+                strategy: 'ipv4_only'
+            },
+            inbounds: [
+                {
+                    type: 'mixed',
+                    tag: 'mixed-in',
+                    listen: '127.0.0.1',
+                    listen_port: 2080,
+                    sniff: true,
+                    sniff_override_destination: true
+                },
+                {
+                    type: 'tun',
+                    tag: 'tun-in',
+                    interface_name: 'sing-box',
+                    address: ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+                    mtu: 9000,
+                    auto_route: true,
+                    strict_route: true,
+                    stack: 'mixed',
+                    sniff: true,
+                    sniff_override_destination: true
+                }
+            ],
+            outbounds: [
+                { type: 'selector', tag: 'select', outbounds: ['direct', ...outboundTags], default: outboundTags[0] || 'direct' },
+                { type: 'selector', tag: '🌍 国外媒体', outbounds: ['select', 'direct', ...outboundTags] },
+                { type: 'selector', tag: '📲 电报信息', outbounds: ['select', 'direct', ...outboundTags] },
+                { type: 'selector', tag: '🌐 谷歌服务', outbounds: ['select', 'direct', ...outboundTags] },
+                { type: 'selector', tag: '🤖 OpenAI', outbounds: ['select', 'direct', ...outboundTags] },
+                { type: 'selector', tag: 'Ⓜ️ 微软服务', outbounds: ['direct', 'select', ...outboundTags] },
+                { type: 'selector', tag: '🍎 苹果服务', outbounds: ['direct', 'select', ...outboundTags] },
+                { type: 'selector', tag: '📺 哔哩哔哩', outbounds: ['direct', 'select', ...outboundTags] },
+                { type: 'selector', tag: '📹 油管视频', outbounds: ['select', '🌍 国外媒体', 'direct', ...outboundTags] },
+                { type: 'selector', tag: '🎬 奈飞视频', outbounds: ['select', '🌍 国外媒体', 'direct', ...outboundTags] },
+                { type: 'selector', tag: '🎯 全球直连', outbounds: ['direct'] },
+                { type: 'selector', tag: '🐟 漏网之鱼', outbounds: ['select', 'direct', ...outboundTags] },
+                ...nodes.map(nodeToOutbound),
+                { type: 'direct', tag: 'direct' },
+                { type: 'block', tag: 'block' },
+                { type: 'dns', tag: 'dns-out' }
+            ],
+            route: {
+                rule_set: [
+                    siteRule('cn'),
+                    siteRule('private'),
+                    siteRule('apple'),
+                    siteRule('apple-cn'),
+                    siteRule('microsoft'),
+                    siteRule('microsoft@cn'),
+                    siteRule('google'),
+                    siteRule('telegram'),
+                    siteRule('openai'),
+                    siteRule('anthropic'),
+                    siteRule('youtube'),
+                    siteRule('netflix'),
+                    siteRule('disney'),
+                    siteRule('spotify'),
+                    siteRule('tiktok'),
+                    siteRule('twitter'),
+                    siteRule('facebook'),
+                    siteRule('github'),
+                    siteRule('geolocation-!cn'),
+                    siteRule('category-ads-all'),
+                    ipRule('cn'),
+                    ipRule('private'),
+                    ipRule('telegram')
+                ],
+                rules: [
+                    { protocol: 'dns', outbound: 'dns-out' },
+                    { ip_is_private: true, outbound: 'direct' },
+                    { rule_set: 'geosite-category-ads-all', outbound: 'block' },
+                    { rule_set: 'geosite-private', outbound: 'direct' },
+                    { rule_set: 'geosite-apple-cn', outbound: 'direct' },
+                    { rule_set: 'geosite-microsoft@cn', outbound: 'direct' },
+                    { rule_set: 'geosite-apple', outbound: '🍎 苹果服务' },
+                    { rule_set: 'geosite-microsoft', outbound: 'Ⓜ️ 微软服务' },
+                    { rule_set: 'geosite-openai', outbound: '🤖 OpenAI' },
+                    { rule_set: 'geosite-anthropic', outbound: '🤖 OpenAI' },
+                    { rule_set: 'geosite-telegram', outbound: '📲 电报信息' },
+                    { rule_set: 'geoip-telegram', outbound: '📲 电报信息' },
+                    { rule_set: 'geosite-google', outbound: '🌐 谷歌服务' },
+                    { rule_set: 'geosite-youtube', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-netflix', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-disney', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-spotify', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-tiktok', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-twitter', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-facebook', outbound: '🌍 国外媒体' },
+                    { rule_set: 'geosite-github', outbound: 'select' },
+                    { rule_set: 'geosite-geolocation-!cn', outbound: 'select' },
+                    { rule_set: 'geosite-cn', outbound: 'direct' },
+                    { rule_set: 'geoip-cn', outbound: 'direct' },
+                    { ip_is_private: true, outbound: 'direct' }
+                ],
+                final: '🐟 漏网之鱼',
+                auto_detect_interface: true
+            },
+            experimental: {
+                cache_file: { enabled: true, store_fakeip: true },
+                clash_api: { external_controller: '127.0.0.1:9090' }
+            }
+        };
+        return JSON.stringify(config, null, 2);
+    }
+
+    // ACL4SSR 规则源（CDN：jsDelivr 镜像 GitHub）
+    const ACL_BASE = 'https://fastly.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash';
+    const aclRule = (name) => `${ACL_BASE}/${name}.list`;
+
+    // 内部生成 Surge ini (完整 ACL4SSR 规则集；仅 Trojan，Surge 不原生支持 VLESS)
+    function generateSurgeIni(links) {
+        const nodes = links.map(parseShareLink).filter(n => n && n.proto === 'trojan');
+        const dnsServer = customDNS || '223.5.5.5';
+        const names = nodes.map(n => n.name);
+        const lines = [
+            '[General]',
+            'loglevel = notify',
+            'internet-test-url = http://www.apple.com/library/test/success.html',
+            'proxy-test-url = http://www.gstatic.com/generate_204',
+            'test-timeout = 3',
+            `dns-server = ${dnsServer.replace(/^https?:\/\//, '').replace(/\/.*$/, '')}, 119.29.29.29, system`,
+            'encrypted-dns-server = https://223.5.5.5/dns-query, https://1.12.12.12/dns-query',
+            'ipv6 = true',
+            'allow-wifi-access = false',
+            'wifi-access-http-port = 6152',
+            'wifi-access-socks5-port = 6153',
+            'skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local, captive.apple.com',
+            'exclude-simple-hostnames = true',
+            'show-error-page-for-reject = true',
+            '',
+            '[Proxy]',
+        ];
+        for (const n of nodes) {
+            const sni = n.sni;
+            lines.push(`${n.name} = trojan, ${n.server}, ${n.port}, password=${n.password}, sni=${sni}, ws=true, ws-path=${n.path}, ws-headers=Host:${n.host}, skip-cert-verify=false, tfo=true`);
+        }
+        if (!nodes.length) {
+            lines.push('Direct = direct');
+        }
+        lines.push('');
+        lines.push('[Proxy Group]');
+        const list = names.length ? names.join(', ') : 'DIRECT';
+        lines.push(`🚀 节点选择 = select, 🎯 全球直连, ${list}`);
+        lines.push(`🌍 国外媒体 = select, ${iniPolicyList(names)}`);
+        lines.push(`📺 哔哩哔哩 = select, ${iniPolicyList(names, { directFirst: true })}`);
+        lines.push(`📹 油管视频 = select, ${iniPolicyList(names, { extraGroups: ['🌍 国外媒体'] })}`);
+        lines.push(`🎬 奈飞视频 = select, ${iniPolicyList(names, { extraGroups: ['🌍 国外媒体'] })}`);
+        lines.push(`📲 电报信息 = select, ${iniPolicyList(names)}`);
+        lines.push(`🌐 谷歌服务 = select, ${iniPolicyList(names)}`);
+        lines.push(`🤖 OpenAI = select, ${iniPolicyList(names)}`);
+        lines.push(`Ⓜ️ 微软服务 = select, ${iniPolicyList(names, { directFirst: true })}`);
+        lines.push(`🍎 苹果服务 = select, ${iniPolicyList(names, { directFirst: true })}`);
+        lines.push(`🎯 全球直连 = select, DIRECT`);
+        lines.push(`🛑 全球拦截 = select, REJECT, DIRECT`);
+        lines.push(`🐟 漏网之鱼 = select, ${iniPolicyList(names)}`);
+        lines.push('');
+        lines.push('[Rule]');
+        lines.push(`RULE-SET,${aclRule('LocalAreaNetwork')},🎯 全球直连`);
+        lines.push(`RULE-SET,${aclRule('UnBan')},🎯 全球直连`);
+        lines.push(`RULE-SET,${aclRule('BanAD')},🛑 全球拦截`);
+        lines.push(`RULE-SET,${aclRule('BanProgramAD')},🛑 全球拦截`);
+        lines.push(`RULE-SET,${aclRule('GoogleFCM')},🌐 谷歌服务`);
+        lines.push(`RULE-SET,${aclRule('GoogleCN')},🎯 全球直连`);
+        lines.push(`RULE-SET,${aclRule('SteamCN')},🎯 全球直连`);
+        lines.push(`RULE-SET,${aclRule('Microsoft')},Ⓜ️ 微软服务`);
+        lines.push(`RULE-SET,${aclRule('Apple')},🍎 苹果服务`);
+        lines.push(`RULE-SET,${aclRule('Telegram')},📲 电报信息`);
+        lines.push(`RULE-SET,${aclRule('OpenAi')},🤖 OpenAI`);
+        lines.push(`RULE-SET,${aclRule('Claude')},🤖 OpenAI`);
+        lines.push(`RULE-SET,${aclRule('Copilot')},🤖 OpenAI`);
+        lines.push(`RULE-SET,${aclRule('Netflix')},🌍 国外媒体`);
+        lines.push(`RULE-SET,${aclRule('YouTube')},🌍 国外媒体`);
+        lines.push(`RULE-SET,${aclRule('Disney')},🌍 国外媒体`);
+        lines.push(`RULE-SET,${aclRule('Spotify')},🌍 国外媒体`);
+        lines.push(`RULE-SET,${aclRule('TikTok')},🌍 国外媒体`);
+        lines.push(`RULE-SET,${aclRule('BiliBili')},📺 哔哩哔哩`);
+        lines.push(`RULE-SET,${aclRule('ProxyMedia')},🌍 国外媒体`);
+        lines.push(`RULE-SET,${aclRule('ProxyGFWlist')},🚀 节点选择`);
+        lines.push(`RULE-SET,${aclRule('ChinaDomain')},🎯 全球直连`);
+        lines.push(`RULE-SET,${aclRule('ChinaCompanyIp')},🎯 全球直连`);
+        lines.push(`RULE-SET,${aclRule('ChinaIp')},🎯 全球直连`);
+        lines.push('GEOIP,CN,🎯 全球直连');
+        lines.push('FINAL,🐟 漏网之鱼,dns-failed');
+        return lines.join('\n');
+    }
+
+    // 内部生成 Loon ini (完整 ACL4SSR 规则集；vless + trojan)
+    function generateLoonIni(links) {
+        const nodes = links.map(parseShareLink).filter(n => n && (n.proto === 'vless' || n.proto === 'trojan'));
+        const names = nodes.map(n => n.name);
+        const lines = [
+            '[General]',
+            'ip-mode = dual',
+            `dns-server = ${(customDNS || '223.5.5.5').replace(/^https?:\/\//, '').replace(/\/.*$/, '')},119.29.29.29,system`,
+            'doh-server = https://223.5.5.5/dns-query, https://1.12.12.12/dns-query',
+            'allow-udp-proxy = true',
+            'allow-wifi-access = false',
+            'sni-sniffing = true',
+            'skip-proxy = 127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,*.local,captive.apple.com',
+            'bypass-tun = 10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.0.0.0/24,192.0.2.0/24,192.88.99.0/24,192.168.0.0/16,198.51.100.0/24,203.0.113.0/24,224.0.0.0/4,255.255.255.255/32',
+            '',
+            '[Proxy]'
+        ];
+        for (const n of nodes) {
+            if (n.proto === 'vless') {
+                const parts = [`${n.server}`, `${n.port}`, `udp=true`, `username=${n.uuid}`, `transport=ws`, `path=${n.path}`, `host=${n.host}`, `over-tls=${n.tls ? 'true' : 'false'}`];
+                if (n.tls) {
+                    parts.push(`tls-name=${n.sni}`);
+                    if (n.alpn && n.alpn.length) parts.push(`alpn=${n.alpn.join(':')}`);
+                    parts.push(`skip-cert-verify=false`);
+                }
+                lines.push(`${n.name} = vless,${parts.join(',')}`);
+            } else {
+                const parts = [`${n.server}`, `${n.port}`, `password=${n.password}`, `transport=ws`, `path=${n.path}`, `host=${n.host}`, `over-tls=true`, `tls-name=${n.sni}`];
+                if (n.alpn && n.alpn.length) parts.push(`alpn=${n.alpn.join(':')}`);
+                parts.push(`skip-cert-verify=false`);
+                lines.push(`${n.name} = trojan,${parts.join(',')}`);
+            }
+        }
+        lines.push('');
+        lines.push('[Proxy Group]');
+        const list = names.length ? names.join(',') : 'DIRECT';
+        lines.push(`🚀 节点选择 = select,🎯 全球直连,${list}`);
+        lines.push(`🌍 国外媒体 = select,${iniPolicyList(names, { compact: true })}`);
+        lines.push(`📺 哔哩哔哩 = select,${iniPolicyList(names, { directFirst: true, compact: true })}`);
+        lines.push(`📹 油管视频 = select,${iniPolicyList(names, { extraGroups: ['🌍 国外媒体'], compact: true })}`);
+        lines.push(`🎬 奈飞视频 = select,${iniPolicyList(names, { extraGroups: ['🌍 国外媒体'], compact: true })}`);
+        lines.push(`📲 电报信息 = select,${iniPolicyList(names, { compact: true })}`);
+        lines.push(`🌐 谷歌服务 = select,${iniPolicyList(names, { compact: true })}`);
+        lines.push(`🤖 OpenAI = select,${iniPolicyList(names, { compact: true })}`);
+        lines.push(`Ⓜ️ 微软服务 = select,${iniPolicyList(names, { directFirst: true, compact: true })}`);
+        lines.push(`🍎 苹果服务 = select,${iniPolicyList(names, { directFirst: true, compact: true })}`);
+        lines.push(`🎯 全球直连 = select,DIRECT`);
+        lines.push(`🛑 全球拦截 = select,REJECT,DIRECT`);
+        lines.push(`🐟 漏网之鱼 = select,${iniPolicyList(names, { compact: true })}`);
+        lines.push('');
+        lines.push('[Remote Rule]');
+        lines.push(`${aclRule('LocalAreaNetwork')}, policy=🎯 全球直连, tag=局域网, enabled=true`);
+        lines.push(`${aclRule('BanAD')}, policy=🛑 全球拦截, tag=广告拦截, enabled=true`);
+        lines.push(`${aclRule('BanProgramAD')}, policy=🛑 全球拦截, tag=应用广告, enabled=true`);
+        lines.push(`${aclRule('GoogleCN')}, policy=🎯 全球直连, tag=GoogleCN, enabled=true`);
+        lines.push(`${aclRule('SteamCN')}, policy=🎯 全球直连, tag=SteamCN, enabled=true`);
+        lines.push(`${aclRule('Microsoft')}, policy=Ⓜ️ 微软服务, tag=微软, enabled=true`);
+        lines.push(`${aclRule('Apple')}, policy=🍎 苹果服务, tag=苹果, enabled=true`);
+        lines.push(`${aclRule('Telegram')}, policy=📲 电报信息, tag=电报, enabled=true`);
+        lines.push(`${aclRule('OpenAi')}, policy=🤖 OpenAI, tag=OpenAI, enabled=true`);
+        lines.push(`${aclRule('Netflix')}, policy=🌍 国外媒体, tag=Netflix, enabled=true`);
+        lines.push(`${aclRule('YouTube')}, policy=🌍 国外媒体, tag=YouTube, enabled=true`);
+        lines.push(`${aclRule('Disney')}, policy=🌍 国外媒体, tag=Disney, enabled=true`);
+        lines.push(`${aclRule('Spotify')}, policy=🌍 国外媒体, tag=Spotify, enabled=true`);
+        lines.push(`${aclRule('TikTok')}, policy=🌍 国外媒体, tag=TikTok, enabled=true`);
+        lines.push(`${aclRule('BiliBili')}, policy=📺 哔哩哔哩, tag=哔哩哔哩, enabled=true`);
+        lines.push(`${aclRule('ProxyMedia')}, policy=🌍 国外媒体, tag=代理媒体, enabled=true`);
+        lines.push(`${aclRule('ProxyGFWlist')}, policy=🚀 节点选择, tag=代理列表, enabled=true`);
+        lines.push(`${aclRule('ChinaDomain')}, policy=🎯 全球直连, tag=中国域名, enabled=true`);
+        lines.push(`${aclRule('ChinaIp')}, policy=🎯 全球直连, tag=中国IP, enabled=true`);
+        lines.push('');
+        lines.push('[Rule]');
+        lines.push('GEOIP,CN,🎯 全球直连');
+        lines.push('FINAL,🐟 漏网之鱼');
+        return lines.join('\n');
+    }
+
+    // 内部生成 Quantumult X 配置（完整 ACL4SSR 远端 filter 资源）
+    function generateQuanxConf(links) {
+        const nodes = links.map(parseShareLink).filter(n => n && (n.proto === 'vless' || n.proto === 'trojan'));
+        const names = nodes.map(n => n.name);
+        const QX_BASE = 'https://fastly.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/QuantumultX';
+        const lines = [
+            '[general]',
+            'network_check_url=http://www.gstatic.com/generate_204',
+            'server_check_url=http://www.gstatic.com/generate_204',
+            'profile_img_url=https://fastly.jsdelivr.net/gh/byJoey/cfnew@main/snippets/logo.png',
+            'dns_exclusion_list=*.cmpassport.com, *.jegotrip.com.cn, *.icloud.com, *.icloud.com.cn, *.apple.com, *.weibo.com, *.qq.com',
+            'running_mode_trigger=filter',
+            '',
+            '[dns]',
+            `server=${(customDNS || '223.5.5.5').replace(/^https?:\/\//, '').replace(/\/.*$/, '')}`,
+            'server=119.29.29.29',
+            'server=https://223.5.5.5/dns-query',
+            'server=https://1.12.12.12/dns-query',
+            '',
+            '[server_local]'
+        ];
+        for (const n of nodes) {
+            if (n.proto === 'vless') {
+                const parts = [`${n.server}:${n.port}`, `method=none`, `password=${n.uuid}`, `obfs=${n.tls ? 'wss' : 'ws'}`, `obfs-host=${n.host}`, `obfs-uri=${n.path}`];
+                if (n.tls) parts.push(`tls-verification=true`, `tls13=true`);
+                parts.push(`tag=${n.name}`);
+                lines.push(`vless=${parts.join(', ')}`);
+            } else {
+                const parts = [`${n.server}:${n.port}`, `password=${n.password}`, `over-tls=true`, `tls-host=${n.sni}`, `obfs=wss`, `obfs-host=${n.host}`, `obfs-uri=${n.path}`, `tls-verification=true`, `tag=${n.name}`];
+                lines.push(`trojan=${parts.join(', ')}`);
+            }
+        }
+        lines.push('');
+        lines.push('[policy]');
+        const list = names.length ? names.join(', ') : 'direct';
+        lines.push(`static=🚀 节点选择, ${list}, direct, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Proxy.png`);
+        lines.push(`static=🌍 国外媒体, ${iniPolicyList(names)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/ForeignMedia.png`);
+        lines.push(`static=📺 哔哩哔哩, ${iniPolicyList(names, { directFirst: true })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/bilibili.png`);
+        lines.push(`static=📹 油管视频, ${iniPolicyList(names, { extraGroups: ['🌍 国外媒体'] })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/YouTube.png`);
+        lines.push(`static=🎬 奈飞视频, ${iniPolicyList(names, { extraGroups: ['🌍 国外媒体'] })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Netflix.png`);
+        lines.push(`static=📲 电报信息, ${iniPolicyList(names)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png`);
+        lines.push(`static=🌐 谷歌服务, ${iniPolicyList(names)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Google.png`);
+        lines.push(`static=🤖 OpenAI, ${iniPolicyList(names)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/ChatGPT.png`);
+        lines.push(`static=Ⓜ️ 微软服务, ${iniPolicyList(names, { directFirst: true })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Microsoft.png`);
+        lines.push(`static=🍎 苹果服务, ${iniPolicyList(names, { directFirst: true })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Apple.png`);
+        lines.push(`static=🎯 全球直连, direct, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Direct.png`);
+        lines.push(`static=🛑 全球拦截, reject, direct, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Advertising.png`);
+        lines.push(`static=🐟 漏网之鱼, ${iniPolicyList(names)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Final.png`);
+        lines.push('');
+        lines.push('[filter_remote]');
+        lines.push(`${QX_BASE}/Lan/Lan.list, tag=局域网, force-policy=🎯 全球直连, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Advertising/Advertising.list, tag=广告拦截, force-policy=🛑 全球拦截, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Microsoft/Microsoft.list, tag=微软, force-policy=Ⓜ️ 微软服务, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Apple/Apple.list, tag=苹果, force-policy=🍎 苹果服务, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Telegram/Telegram.list, tag=电报, force-policy=📲 电报信息, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Google/Google.list, tag=谷歌, force-policy=🌐 谷歌服务, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/OpenAI/OpenAI.list, tag=OpenAI, force-policy=🤖 OpenAI, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Claude/Claude.list, tag=Claude, force-policy=🤖 OpenAI, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/YouTube/YouTube.list, tag=YouTube, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Netflix/Netflix.list, tag=Netflix, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Disney/Disney.list, tag=Disney, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Spotify/Spotify.list, tag=Spotify, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/TikTok/TikTok.list, tag=TikTok, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/BiliBili/BiliBili.list, tag=哔哩哔哩, force-policy=📺 哔哩哔哩, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/Global/Global.list, tag=全球加速, force-policy=🚀 节点选择, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push(`${QX_BASE}/ChinaMax/ChinaMax.list, tag=中国直连, force-policy=🎯 全球直连, update-interval=86400, opt-parser=false, enabled=true`);
+        lines.push('');
+        lines.push('[filter_local]');
+        lines.push('geoip, cn, 🎯 全球直连');
+        lines.push('final, 🐟 漏网之鱼');
+        return lines.join('\n');
+    }
+
+    // 兼容旧调用名
+    async function generateClashConfig(links) {
+        return generateClashYaml(links);
+    }
+    function generateSurgeConfig(links) { return generateSurgeIni(links); }
+    function generateLoonConfig(links) { return generateLoonIni(links); }
+    function generateQuantumultXConfig(links) { return generateQuanxConf(links); }
+    function generateSingBoxConfig(links) { return generateSingBoxJson(links); }
+    function generateSSConfig(links) { return btoa(links.join('\n')); }
+    function generateV2RayConfig(links) { return btoa(links.join('\n')); }
 
     // 全局变量存储ECH调试信息
     let echDebugInfo = '';
@@ -1723,6 +2591,7 @@
         const finalLinks = [];
         const workerDomain = url.hostname;
         const target = url.searchParams.get('target') || 'base64';
+        const aliasNamer = createCompactNodeNamer(false);
 
         // 如果启用了ECH，使用自定义值
         let echConfig = null;
@@ -1734,13 +2603,13 @@
 
         async function addNodesFromList(list) {
             if (ev) {
-                finalLinks.push(...generateLinksFromSource(list, user, workerDomain, echConfig));
+                finalLinks.push(...generateLinksFromSource(list, user, workerDomain, echConfig, false, aliasNamer));
             }
             if (et) {
-                finalLinks.push(...await generateTrojanLinksFromSource(list, user, workerDomain, echConfig));
+                finalLinks.push(...await generateTrojanLinksFromSource(list, user, workerDomain, echConfig, false, aliasNamer));
             }
             if (ex) {
-                finalLinks.push(...generateXhttpLinksFromSource(list, user, workerDomain, echConfig));
+                finalLinks.push(...generateXhttpLinksFromSource(list, user, workerDomain, echConfig, false, aliasNamer));
             }
         }
 
@@ -1813,16 +2682,16 @@
 
             if (egi) {
             try {
-                const newIPList = await fetchAndParseNewIPs();
+                    const newIPList = await fetchAndParseNewIPs();
                 if (newIPList.length > 0) {
                     if (ev) {
-                        finalLinks.push(...generateLinksFromNewIPs(newIPList, user, workerDomain, echConfig));
+                        finalLinks.push(...generateLinksFromNewIPs(newIPList, user, workerDomain, echConfig, false, aliasNamer));
                     }
                     if (et) {
-                        finalLinks.push(...await generateTrojanLinksFromNewIPs(newIPList, user, workerDomain, echConfig));
+                        finalLinks.push(...await generateTrojanLinksFromNewIPs(newIPList, user, workerDomain, echConfig, false, aliasNamer));
                     }
                     if (ex) {
-                         finalLinks.push(...generateXhttpLinksFromSource(newIPList, user, workerDomain, echConfig));
+                         finalLinks.push(...generateXhttpLinksFromSource(newIPList, user, workerDomain, echConfig, false, aliasNamer));
                     }
                 }
             } catch (error) {
@@ -1852,31 +2721,43 @@
         let contentType = 'text/plain; charset=utf-8';
 
         switch (target.toLowerCase()) {
-            case atob('Y2xhc2g='):
-            case atob('Y2xhc2hy'):
-                subscriptionContent = await generateClashConfig(finalLinks, request, user);
+            case atob('Y2xhc2g='):     // clash
+            case atob('Y2xhc2hy'):     // clashr
+            case 'stash':
+            case 'meta':
+            case 'clashmeta':
+                subscriptionContent = generateClashYaml(finalLinks);
                 contentType = 'text/yaml; charset=utf-8';
                 break;
-            case atob('c3VyZ2U='):
+            case atob('c3VyZ2U='):     // surge
             case atob('c3VyZ2Uy'):
             case atob('c3VyZ2Uz'):
             case atob('c3VyZ2U0'):
-                subscriptionContent = generateSurgeConfig(finalLinks);
+                subscriptionContent = generateSurgeIni(finalLinks);
+                contentType = 'text/plain; charset=utf-8';
                 break;
-            case atob('cXVhbnR1bXVsdA=='):
-            case atob('cXVhbng='):
+            case atob('cXVhbnR1bXVsdA=='):  // quantumult
+            case atob('cXVhbng='):          // quanx
             case 'quanx':
-                subscriptionContent = generateQuantumultConfig(finalLinks);
+                subscriptionContent = generateQuanxConf(finalLinks);
+                contentType = 'text/plain; charset=utf-8';
                 break;
             case atob('c3M='):
             case atob('c3Ny'):
-                subscriptionContent = generateSSConfig(finalLinks);
+                subscriptionContent = btoa(finalLinks.join('\n'));
                 break;
             case atob('djJyYXk='):
-                subscriptionContent = generateV2RayConfig(finalLinks);
+                subscriptionContent = btoa(finalLinks.join('\n'));
                 break;
             case atob('bG9vbg=='):
-                subscriptionContent = generateLoonConfig(finalLinks);
+                subscriptionContent = generateLoonIni(finalLinks);
+                contentType = 'text/plain; charset=utf-8';
+                break;
+            case atob('c2luZ2JveA=='):  // singbox
+            case 'sing-box':
+            case 'singbox':
+                subscriptionContent = generateSingBoxJson(finalLinks);
+                contentType = 'application/json; charset=utf-8';
                 break;
             default:
                 subscriptionContent = btoa(finalLinks.join('\n'));
@@ -1900,7 +2781,7 @@
         });
     }
 
-    function generateLinksFromSource(list, user, workerDomain, echConfig = null, skipNumbering = false) {
+    function generateLinksFromSource(list, user, workerDomain, echConfig = null, skipNumbering = false, aliasNamer = null) {
         const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
         const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 
@@ -1910,13 +2791,9 @@
         const wsPath = '/?ed=2048';
         const proto = atob('dmxlc3M=');
 
-        const { namer, setSkipNumbering } = createNodeNamer(skipNumbering);
+        const makeNodeName = aliasNamer || createCompactNodeNamer(skipNumbering);
 
         for (const item of list) {
-            let nodeNameBase = item.isp.replace(/\s/g, '_');
-            if (item.colo && item.colo.trim()) {
-                nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
-            }
             const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
             let portsToGenerate = [];
@@ -1941,14 +2818,7 @@
             }
 
             for (const { port, tls } of portsToGenerate) {
-                const suffix = tls ? '-WS-TLS' : '-WS';
-                const nodeName = `${nodeNameBase}-${port}${suffix}`;
-                let wsNodeName;
-                if (skipNumbering) {
-                    wsNodeName = nodeName;           // 不编号
-                } else {
-                    wsNodeName = namer(nodeNameBase, nodeName);  // 编号
-                }
+                const wsNodeName = makeNodeName(item);
 
                 if (tls) {
                     const wsParams = new URLSearchParams({ 
@@ -1960,12 +2830,12 @@
                         host: workerDomain, 
                         path: wsPath
                     });
+                    applyALPNParam(wsParams);
 
                     // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
                     if (enableECH) {
                         const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                         const echDomain = customECHDomain || 'cloudflare-ech.com';
-                        wsParams.set('alpn', 'h3');
                         wsParams.set('ech', `${echDomain}+${dnsServer}`);
                     }
 
@@ -1986,7 +2856,7 @@
         return links;
     }
 
-    async function generateTrojanLinksFromSource(list, user, workerDomain, echConfig = null, skipNumbering = false) {
+    async function generateTrojanLinksFromSource(list, user, workerDomain, echConfig = null, skipNumbering = false, aliasNamer = null) {
         const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
         const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 
@@ -1997,13 +2867,9 @@
 
         const password = tp || user;
 
-        const { namer, setSkipNumbering } = createNodeNamer(skipNumbering);
+        const makeNodeName = aliasNamer || createCompactNodeNamer(skipNumbering);
 
         for (const item of list) {
-            let nodeNameBase = item.isp.replace(/\s/g, '_');
-            if (item.colo && item.colo.trim()) {
-                nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
-            }
             const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
             let portsToGenerate = [];
@@ -2028,14 +2894,7 @@
             }
 
             for (const { port, tls } of portsToGenerate) {
-                const suffix = tls ? `-${atob('VHJvamFu')}-WS-TLS` : `-${atob('VHJvamFu')}-WS`;
-                const nodeName = `${nodeNameBase}-${port}${suffix}`;
-                let wsNodeName;
-                if (skipNumbering) {
-                    wsNodeName = nodeName;           // 不编号
-                } else {
-                    wsNodeName = namer(nodeNameBase, nodeName);  // 编号
-                }
+                const wsNodeName = makeNodeName(item);
 
                 if (tls) {
                     const wsParams = new URLSearchParams({ 
@@ -2046,12 +2905,12 @@
                         host: workerDomain, 
                         path: wsPath
                     });
+                    applyALPNParam(wsParams);
 
                     // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
                     if (enableECH) {
                         const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                         const echDomain = customECHDomain || 'cloudflare-ech.com';
-                        wsParams.set('alpn', 'h3');
                         wsParams.set('ech', `${echDomain}+${dnsServer}`);
                     }
 
@@ -2184,27 +3043,84 @@
         const wsPair = new WebSocketPair();
         const [clientSock, serverSock] = Object.values(wsPair);
         serverSock.accept();
+        serverSock.binaryType = 'arraybuffer';
 
-        let remoteConnWrapper = { socket: null };
+        let remoteConnWrapper = { socket: null, writer: null, drainUpload: null };
         let isDnsQuery = false;
         let protocolType = null; 
+        let uploadBusy = false;
+        let transportClosed = false;
+        const uploadQueue = createChunkQueue(TRANSPORT_UP_PACK, TRANSPORT_UP_Q_MAX, TRANSPORT_UP_Q_MAX >> 8);
+        const requestFetcher = request.fetcher;
+
+        function releaseRemoteWriter() {
+            try { remoteConnWrapper.writer?.releaseLock(); } catch (_) {}
+            remoteConnWrapper.writer = null;
+        }
+
+        function closeTransport() {
+            if (transportClosed) return;
+            transportClosed = true;
+            uploadQueue.clear();
+            releaseRemoteWriter();
+            try { remoteConnWrapper.socket?.close(); } catch (_) {}
+            closeSocketQuietly(serverSock);
+        }
+
+        function queueUpload(chunk) {
+            const data = toUint8Array(chunk);
+            if (!data.byteLength) return true;
+            if (!uploadQueue.sow(data)) {
+                closeTransport();
+                return false;
+            }
+            remoteConnWrapper.drainUpload();
+            return true;
+        }
+
+        async function drainUpload() {
+            if (uploadBusy || transportClosed || !remoteConnWrapper.writer) return;
+            uploadBusy = true;
+            try {
+                for (;;) {
+                    if (transportClosed || !remoteConnWrapper.writer) break;
+                    const [data] = uploadQueue.bundle();
+                    if (!data) break;
+                    await remoteConnWrapper.writer.write(data);
+                }
+            } catch (_) {
+                closeTransport();
+            } finally {
+                uploadBusy = false;
+                if (!uploadQueue.empty && !transportClosed && remoteConnWrapper.writer) queueMicrotask(drainUpload);
+            }
+        }
+
+        remoteConnWrapper.drainUpload = () => {
+            if (!uploadBusy && !uploadQueue.empty && remoteConnWrapper.writer) queueMicrotask(drainUpload);
+        };
 
         const earlyData = request.headers.get(atob('c2VjLXdlYnNvY2tldC1wcm90b2NvbA==')) || '';
         const readable = makeReadableStream(serverSock, earlyData);
 
         readable.pipeTo(new WritableStream({
             async write(chunk) {
-                if (isDnsQuery) return await forwardUDP(chunk, serverSock, null);
-                if (remoteConnWrapper.socket) {
-                    const writer = remoteConnWrapper.socket.writable.getWriter();
-                    await writer.write(chunk);
-                    writer.releaseLock();
+                if (transportClosed) return;
+                const data = toUint8Array(chunk);
+                if (isDnsQuery) return await forwardUDP(data, serverSock, null, requestFetcher);
+                if (remoteConnWrapper.socket && remoteConnWrapper.writer) {
+                    if (!queueUpload(data)) throw new Error('upload queue overflow');
+                    return;
+                }
+
+                if (protocolType) {
+                    if (!queueUpload(data)) throw new Error('upload queue overflow');
                     return;
                 }
 
                 if (!protocolType) {
-                    if (ev && chunk.byteLength >= 24) {
-                        const vlessResult = parseWsPacketHeader(chunk, at);
+                    if (ev && data.byteLength >= 24) {
+                        const vlessResult = parseWsPacketHeader(data, at);
                         if (!vlessResult.hasError) {
                             protocolType = 'vless';
                             const { addressType, port, hostname, rawIndex, version, isUDP } = vlessResult;
@@ -2213,19 +3129,19 @@
                     else throw new Error(E_UDP_DNS_ONLY);
                 }
                 const respHeader = new Uint8Array([version[0], 0]);
-                const rawData = chunk.slice(rawIndex);
-                if (isDnsQuery) return forwardUDP(rawData, serverSock, respHeader);
-                    await forwardTCP(addressType, hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, reqFallback, effectiveRegion, reqRm, reqSocksConfig);
+                const rawData = data.subarray(rawIndex);
+                if (isDnsQuery) return forwardUDP(rawData, serverSock, respHeader, requestFetcher);
+                    await forwardTCP(addressType, hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, reqFallback, effectiveRegion, reqRm, reqSocksConfig, requestFetcher);
                             return;
                         }
                     }
 
-                    if (et && chunk.byteLength >= 56) {
-                        const tjResult = await parseTrojanHeader(chunk, at);
+                    if (et && data.byteLength >= 56) {
+                        const tjResult = await parseTrojanHeader(data, at);
                         if (!tjResult.hasError) {
                             protocolType = atob('dHJvamFu');
                             const { addressType, port, hostname, rawClientData } = tjResult;
-                            await forwardTCP(addressType, hostname, port, rawClientData, serverSock, null, remoteConnWrapper, reqFallback, effectiveRegion, reqRm, reqSocksConfig);
+                            await forwardTCP(addressType, hostname, port, rawClientData, serverSock, null, remoteConnWrapper, reqFallback, effectiveRegion, reqRm, reqSocksConfig, requestFetcher);
                             return;
                         }
                     }
@@ -2233,36 +3149,61 @@
                     throw new Error('Invalid protocol or authentication failed');
                 }
             },
-        })).catch((err) => { });
+        })).catch((err) => { closeTransport(); });
 
         return new Response(null, { status: 101, webSocket: clientSock });
     }
 
-    async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper, reqFallback = '', reqRegion = '', reqRm = null, reqSocksConfig = null) {
+    async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper, reqFallback = '', reqRegion = '', reqRm = null, reqSocksConfig = null, requestFetcher = null) {
         // 优先使用客户端path参数，其次回退到全局配置
         const effectiveFallback = reqFallback || fallbackAddress;
         const effectiveRegion = reqRegion || currentWorkerRegion;
         const effectiveRegionMatching = reqRm !== null ? reqRm : enableRegionMatching;
         const effectiveSocksConfig = reqSocksConfig || parsedSocks5Config;
         const effectiveSocksEnabled = reqSocksConfig ? true : isSocksEnabled;
+        const initialData = toUint8Array(rawData);
 
         async function connectAndSend(address, port, useSocks = false) {
             const remoteSock = useSocks ?
                 await establishSocksConnection(addrType, address, port, effectiveSocksConfig) :
-                connect({ hostname: address, port: port });
+                await connectTcpSocket(address, port, requestFetcher, TRANSPORT_CONNECT_RACE);
             const writer = remoteSock.writable.getWriter();
-            await writer.write(rawData);
-            writer.releaseLock();
-            return remoteSock;
+            if (initialData.byteLength) await writer.write(initialData);
+            return { remoteSock, writer };
+        }
+
+        function detachIfCurrent(remoteSock, writer) {
+            if (remoteConnWrapper.socket !== remoteSock) return;
+            try { writer?.releaseLock(); } catch (_) {}
+            remoteConnWrapper.socket = null;
+            remoteConnWrapper.writer = null;
+        }
+
+        function attachRemote(remoteSock, writer, retryFunc) {
+            try {
+                if (remoteConnWrapper.writer && remoteConnWrapper.writer !== writer) {
+                    remoteConnWrapper.writer.releaseLock();
+                }
+            } catch (_) {}
+            remoteConnWrapper.socket = remoteSock;
+            remoteConnWrapper.writer = writer;
+            remoteConnWrapper.drainUpload?.();
+            remoteSock.closed.catch(() => {}).finally(() => {
+                if (remoteConnWrapper.socket === remoteSock) closeSocketQuietly(ws);
+            });
+            connectStreams(remoteSock, ws, respHeader, retryFunc).finally(() => {
+                if (remoteConnWrapper.socket === remoteSock) {
+                    try { writer.releaseLock(); } catch (_) {}
+                    remoteConnWrapper.writer = null;
+                }
+            });
         }
 
         async function retryConnection() {
             if (enableSocksDowngrade && effectiveSocksEnabled) {
                 try {
-                    const socksSocket = await connectAndSend(host, portNum, true);
-                    remoteConnWrapper.socket = socksSocket;
-                    socksSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
-                    connectStreams(socksSocket, ws, respHeader, null);
+                    const { remoteSock: socksSocket, writer: socksWriter } = await connectAndSend(host, portNum, true);
+                    attachRemote(socksSocket, socksWriter, null);
                     return;
                 } catch (socksErr) {
                     let backupHost, backupPort;
@@ -2277,10 +3218,8 @@
                     }
 
                     try {
-                        const fallbackSocket = await connectAndSend(backupHost, backupPort, false);
-                        remoteConnWrapper.socket = fallbackSocket;
-                        fallbackSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
-                        connectStreams(fallbackSocket, ws, respHeader, null);
+                        const { remoteSock: fallbackSocket, writer: fallbackWriter } = await connectAndSend(backupHost, backupPort, false);
+                        attachRemote(fallbackSocket, fallbackWriter, null);
                     } catch (fallbackErr) {
                         closeSocketQuietly(ws);
                     }
@@ -2298,10 +3237,8 @@
                 }
 
                 try {
-                    const fallbackSocket = await connectAndSend(backupHost, backupPort, effectiveSocksEnabled);
-                    remoteConnWrapper.socket = fallbackSocket;
-                    fallbackSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
-                    connectStreams(fallbackSocket, ws, respHeader, null);
+                    const { remoteSock: fallbackSocket, writer: fallbackWriter } = await connectAndSend(backupHost, backupPort, effectiveSocksEnabled);
+                    attachRemote(fallbackSocket, fallbackWriter, null);
                 } catch (fallbackErr) {
                     closeSocketQuietly(ws);
                 }
@@ -2309,30 +3246,266 @@
         }
         
         try {
-            const initialSocket = await connectAndSend(host, portNum, enableSocksDowngrade ? false : effectiveSocksEnabled);
-            remoteConnWrapper.socket = initialSocket;
-            connectStreams(initialSocket, ws, respHeader, retryConnection);
+            const { remoteSock: initialSocket, writer: initialWriter } = await connectAndSend(host, portNum, enableSocksDowngrade ? false : effectiveSocksEnabled);
+            attachRemote(initialSocket, initialWriter, () => {
+                detachIfCurrent(initialSocket, initialWriter);
+                retryConnection();
+            });
         } catch (err) {
-            retryConnection();
+            await retryConnection();
         }
     }
 
+    function toUint8Array(chunk) {
+        if (chunk instanceof Uint8Array) return chunk;
+        if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+        if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        return new Uint8Array(chunk);
+    }
+
+    function joinUint8Array(head, body) {
+        const h = toUint8Array(head);
+        const b = toUint8Array(body);
+        const out = new Uint8Array(h.byteLength + b.byteLength);
+        out.set(h);
+        out.set(b, h.byteLength);
+        return out;
+    }
+
+    function createChunkQueue(cap, qCap = cap, itemsMax = Math.max(1, qCap >> 8)) {
+        let queue = [];
+        let head = 0;
+        let queuedBytes = 0;
+        let bundleBuffer = null;
+
+        function trim() {
+            if (head > 32 && head * 2 >= queue.length) {
+                queue = queue.slice(head);
+                head = 0;
+            }
+        }
+
+        function take() {
+            if (head >= queue.length) return null;
+            const data = queue[head];
+            queue[head++] = undefined;
+            queuedBytes -= data.byteLength;
+            trim();
+            return data;
+        }
+
+        return {
+            get empty() { return head >= queue.length; },
+            clear() {
+                queue = [];
+                head = 0;
+                queuedBytes = 0;
+            },
+            sow(data) {
+                const n = data?.byteLength || 0;
+                if (!n) return true;
+                if (queuedBytes + n > qCap || queue.length - head >= itemsMax) return false;
+                queue.push(data);
+                queuedBytes += n;
+                return true;
+            },
+            bundle(data = null) {
+                data ||= take();
+                if (!data || head >= queue.length || data.byteLength >= cap) return [data, false];
+                let total = data.byteLength;
+                let end = head;
+                while (end < queue.length) {
+                    const next = queue[end];
+                    const nextTotal = total + next.byteLength;
+                    if (nextTotal > cap) break;
+                    total = nextTotal;
+                    end++;
+                }
+                if (end === head) return [data, false];
+                const out = bundleBuffer ||= new Uint8Array(cap);
+                out.set(data);
+                let offset = data.byteLength;
+                while (head < end) {
+                    const next = queue[head];
+                    queue[head++] = undefined;
+                    queuedBytes -= next.byteLength;
+                    out.set(next, offset);
+                    offset += next.byteLength;
+                }
+                trim();
+                return [out.subarray(0, total), true];
+            }
+        };
+    }
+
+    function createDownlinkGrain(webSocket) {
+        const cap = TRANSPORT_DN_PACK;
+        const tail = TRANSPORT_DN_TAIL;
+        const lowWater = Math.max(4096, tail << 3);
+        let pending = new Uint8Array(cap);
+        let pendingBytes = 0;
+        let timer = 0;
+        let microtaskQueued = false;
+        let generation = 0;
+        let quietKey = 0;
+        let quietRounds = 0;
+
+        function flush() {
+            if (timer) clearTimeout(timer);
+            timer = 0;
+            microtaskQueued = false;
+            if (!pendingBytes) return;
+            if (webSocket.readyState === 1) webSocket.send(pending.subarray(0, pendingBytes).slice());
+            pending = new Uint8Array(cap);
+            pendingBytes = 0;
+            quietRounds = 0;
+        }
+
+        function schedule() {
+            if (timer || microtaskQueued) return;
+            microtaskQueued = true;
+            quietKey = generation;
+            queueMicrotask(() => {
+                microtaskQueued = false;
+                if (!pendingBytes || timer) return;
+                if (cap - pendingBytes < tail) return flush();
+                timer = setTimeout(() => {
+                    timer = 0;
+                    if (!pendingBytes) return;
+                    if (cap - pendingBytes < tail) return flush();
+                    if (quietRounds < 2 && (generation !== quietKey || pendingBytes < lowWater)) {
+                        quietRounds++;
+                        quietKey = generation;
+                        return schedule();
+                    }
+                    flush();
+                }, Math.max(TRANSPORT_DN_DELAY, 1));
+            });
+        }
+
+        return {
+            send(chunk) {
+                const data = toUint8Array(chunk);
+                let offset = 0;
+                const total = data.byteLength;
+                if (!total) return;
+                while (offset < total) {
+                    if (!pendingBytes && total - offset >= cap) {
+                        const size = Math.min(cap, total - offset);
+                        if (webSocket.readyState === 1) webSocket.send(offset || size !== total ? data.subarray(offset, offset + size) : data);
+                        offset += size;
+                        continue;
+                    }
+                    const size = Math.min(cap - pendingBytes, total - offset);
+                    pending.set(data.subarray(offset, offset + size), pendingBytes);
+                    pendingBytes += size;
+                    offset += size;
+                    generation++;
+                    if (pendingBytes === cap || cap - pendingBytes < tail) flush();
+                    else schedule();
+                }
+            },
+            flush
+        };
+    }
+
+    function openTcpSocket(address, port, requestFetcher = null) {
+        const target = { hostname: address, port };
+        if (requestFetcher && typeof requestFetcher.connect === 'function') return requestFetcher.connect(target);
+        return connect(target);
+    }
+
+    async function openTcpSocketReady(address, port, requestFetcher = null) {
+        try {
+            const socket = openTcpSocket(address, port, requestFetcher);
+            if (socket?.opened) await socket.opened;
+            return socket;
+        } catch (error) {
+            if (!requestFetcher) throw error;
+            const socket = connect({ hostname: address, port });
+            if (socket?.opened) await socket.opened;
+            return socket;
+        }
+    }
+
+    async function connectTcpSocket(address, port, requestFetcher = null, raceCount = 1) {
+        const count = Math.max(1, raceCount | 0);
+        if (count <= 1) return openTcpSocketReady(address, port, requestFetcher);
+        const attempts = Array.from({ length: count }, () => openTcpSocketReady(address, port, requestFetcher));
+        const winner = await Promise.any(attempts);
+        attempts.forEach((attempt) => {
+            attempt.then((socket) => {
+                if (socket !== winner) {
+                    try { socket.close(); } catch (_) {}
+                }
+            }, () => {});
+        });
+        return winner;
+    }
+
+    function getUuidBytes(token) {
+        if (uuidByteCache.has(token)) return uuidByteCache.get(token);
+        const hex = String(token || '').replace(/-/g, '');
+        if (hex.length !== 32) return null;
+        const bytes = new Uint8Array(16);
+        for (let i = 0; i < 16; i++) {
+            const value = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+            if (Number.isNaN(value)) return null;
+            bytes[i] = value;
+        }
+        if (uuidByteCache.size > 16) uuidByteCache.clear();
+        uuidByteCache.set(token, bytes);
+        return bytes;
+    }
+
+    function matchesUuid(bytes, offset, token) {
+        const id = getUuidBytes(token);
+        return !!id &&
+            bytes[offset] === id[0] && bytes[offset + 1] === id[1] &&
+            bytes[offset + 2] === id[2] && bytes[offset + 3] === id[3] &&
+            bytes[offset + 4] === id[4] && bytes[offset + 5] === id[5] &&
+            bytes[offset + 6] === id[6] && bytes[offset + 7] === id[7] &&
+            bytes[offset + 8] === id[8] && bytes[offset + 9] === id[9] &&
+            bytes[offset + 10] === id[10] && bytes[offset + 11] === id[11] &&
+            bytes[offset + 12] === id[12] && bytes[offset + 13] === id[13] &&
+            bytes[offset + 14] === id[14] && bytes[offset + 15] === id[15];
+    }
+
     function parseWsPacketHeader(chunk, token) {
-        if (chunk.byteLength < 24) return { hasError: true, message: E_INVALID_DATA };
-        const version = new Uint8Array(chunk.slice(0, 1));
-        if (formatIdentifier(new Uint8Array(chunk.slice(1, 17))) !== token) return { hasError: true, message: E_INVALID_USER };
-        const optLen = new Uint8Array(chunk.slice(17, 18))[0];
-        const cmd = new Uint8Array(chunk.slice(18 + optLen, 19 + optLen))[0];
+        const bytes = toUint8Array(chunk);
+        if (bytes.byteLength < 24) return { hasError: true, message: E_INVALID_DATA };
+        const version = bytes.subarray(0, 1);
+        if (!matchesUuid(bytes, 1, token)) return { hasError: true, message: E_INVALID_USER };
+        const optLen = bytes[17];
+        const cmdIdx = 18 + optLen;
+        if (bytes.byteLength < cmdIdx + 5) return { hasError: true, message: E_INVALID_DATA };
+        const cmd = bytes[cmdIdx];
         let isUDP = false;
         if (cmd === 1) {} else if (cmd === 2) { isUDP = true; } else { return { hasError: true, message: E_UNSUPPORTED_CMD }; }
         const portIdx = 19 + optLen;
-        const port = new DataView(chunk.slice(portIdx, portIdx + 2)).getUint16(0);
+        const port = (bytes[portIdx] << 8) | bytes[portIdx + 1];
         let addrIdx = portIdx + 2, addrLen = 0, addrValIdx = addrIdx + 1, hostname = '';
-        const addressType = new Uint8Array(chunk.slice(addrIdx, addrValIdx))[0];
+        const addressType = bytes[addrIdx];
         switch (addressType) {
-            case ADDRESS_TYPE_IPV4: addrLen = 4; hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); break;
-            case ADDRESS_TYPE_URL: addrLen = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + 1))[0]; addrValIdx += 1; hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); break;
-            case ADDRESS_TYPE_IPV6: addrLen = 16; const ipv6 = []; const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen)); for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16)); hostname = ipv6.join(':'); break;
+            case ADDRESS_TYPE_IPV4:
+                addrLen = 4;
+                if (bytes.byteLength < addrValIdx + addrLen) return { hasError: true, message: E_INVALID_DATA };
+                hostname = `${bytes[addrValIdx]}.${bytes[addrValIdx + 1]}.${bytes[addrValIdx + 2]}.${bytes[addrValIdx + 3]}`;
+                break;
+            case ADDRESS_TYPE_URL:
+                if (bytes.byteLength < addrValIdx + 1) return { hasError: true, message: E_INVALID_DATA };
+                addrLen = bytes[addrValIdx++];
+                if (bytes.byteLength < addrValIdx + addrLen) return { hasError: true, message: E_INVALID_DATA };
+                hostname = sharedDecoder.decode(bytes.subarray(addrValIdx, addrValIdx + addrLen));
+                break;
+            case ADDRESS_TYPE_IPV6:
+                addrLen = 16;
+                if (bytes.byteLength < addrValIdx + addrLen) return { hasError: true, message: E_INVALID_DATA };
+                const ipv6 = [];
+                const ipv6View = new DataView(bytes.buffer, bytes.byteOffset + addrValIdx, addrLen);
+                for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
+                hostname = ipv6.join(':');
+                break;
             default: return { hasError: true, message: `${E_INVALID_ADDR_TYPE}: ${addressType}` };
         }
         if (!hostname) return { hasError: true, message: `${E_EMPTY_ADDR}: ${addressType}` };
@@ -2343,47 +3516,95 @@
         let cancelled = false;
         return new ReadableStream({
             start(controller) {
-                socket.addEventListener('message', (event) => { if (!cancelled) controller.enqueue(event.data); });
+                socket.addEventListener('message', (event) => { if (!cancelled) controller.enqueue(toUint8Array(event.data)); });
                 socket.addEventListener('close', () => { if (!cancelled) { closeSocketQuietly(socket); controller.close(); } });
                 socket.addEventListener('error', (err) => controller.error(err));
                 const { earlyData, error } = base64ToArray(earlyDataHeader);
-                if (error) controller.error(error); else if (earlyData) controller.enqueue(earlyData);
+                if (error) controller.error(error); else if (earlyData) controller.enqueue(toUint8Array(earlyData));
             },
             cancel() { cancelled = true; closeSocketQuietly(socket); }
         });
     }
 
     async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
-        let header = headerData, hasData = false;
-        await remoteSocket.readable.pipeTo(
-            new WritableStream({
-                async write(chunk, controller) {
+        let header = headerData, hasData = false, retried = false;
+
+        // 关键：CF 直连有时握手成功但远端长时间无数据，需要超时触发 SOCKS5 降级
+        let firstByteTimer = null;
+        if (retryFunc) {
+            firstByteTimer = setTimeout(() => {
+                if (!hasData && !retried) {
+                    retried = true;
+                    try { remoteSocket.close && remoteSocket.close(); } catch (_) {}
+                    retryFunc();
+                }
+            }, FIRST_BYTE_TIMEOUT);
+        }
+
+        const tx = createDownlinkGrain(webSocket);
+        let reader = null;
+        let byob = true;
+        let buffer = new ArrayBuffer(TRANSPORT_CHUNK_SIZE);
+
+        try {
+            try {
+                reader = remoteSocket.readable.getReader({ mode: 'byob' });
+            } catch (_) {
+                byob = false;
+                reader = remoteSocket.readable.getReader();
+            }
+
+            for (;;) {
+                const result = byob ? await reader.read(new Uint8Array(buffer, 0, TRANSPORT_CHUNK_SIZE)) : await reader.read();
+                if (result.done) break;
+                const readValue = result.value;
+                let chunk = toUint8Array(readValue);
+                const reusableBuffer = byob && readValue?.buffer instanceof ArrayBuffer && readValue.buffer.byteLength >= TRANSPORT_CHUNK_SIZE
+                    ? readValue.buffer
+                    : new ArrayBuffer(TRANSPORT_CHUNK_SIZE);
+                if (!chunk.byteLength) continue;
+
+                if (!hasData) {
                     hasData = true;
-                    if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
-                    if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
-                    else { webSocket.send(chunk); }
-                },
-                abort(reason) { },
-            })
-        ).catch((error) => { closeSocketQuietly(webSocket); });
-        if (!hasData && retryFunc) retryFunc();
+                    if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+                }
+
+                if (webSocket.readyState !== 1) throw new Error(E_WS_NOT_OPEN);
+                if (header) {
+                    chunk = joinUint8Array(header, chunk);
+                    header = null;
+                }
+
+                if (chunk.byteLength >= (TRANSPORT_CHUNK_SIZE >> 1)) {
+                    tx.flush();
+                    webSocket.send(chunk);
+                    if (byob) buffer = new ArrayBuffer(TRANSPORT_CHUNK_SIZE);
+                } else {
+                    tx.send(chunk.slice());
+                    if (byob) buffer = reusableBuffer;
+                }
+            }
+            tx.flush();
+        } catch (error) {
+            // 已经触发 retry 时不要关闭 WS（retry 会重新挂载新 socket）
+            if (!retried) closeSocketQuietly(webSocket);
+        } finally {
+            try { tx.flush(); } catch (_) {}
+            try { reader?.releaseLock(); } catch (_) {}
+        }
+
+        if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+        if (!hasData && !retried && retryFunc) retryFunc();
     }
 
-    async function forwardUDP(udpChunk, webSocket, respHeader) {
+    async function forwardUDP(udpChunk, webSocket, respHeader, requestFetcher = null) {
         try {
-            const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
+            const tcpSocket = await connectTcpSocket('8.8.4.4', 53, requestFetcher, 1);
             let header = respHeader;
             const writer = tcpSocket.writable.getWriter();
             await writer.write(udpChunk);
             writer.releaseLock();
-            await tcpSocket.readable.pipeTo(new WritableStream({
-                async write(chunk) {
-                    if (webSocket.readyState === 1) {
-                        if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
-                        else { webSocket.send(chunk); }
-                    }
-                },
-            }));
+            await connectStreams(tcpSocket, webSocket, header, null);
         } catch (error) { }
     }
 
@@ -2534,7 +3755,7 @@
                 enablePreferredDomain: '启用优选域名',
                 enablePreferredIP: '启用优选 IP',
                 enableNativeAddress: '启用原生地址',
-                enableGitHubPreferred: '启用 GitHub 默认优选',
+                enableGitHubPreferred: '启用自定义优选',
                 allowAPIManagement: '允许API管理 (ae):',
                 regionMatching: '地区匹配 (rm):',
                 downgradeControl: '降级控制 (qj):',
@@ -2558,9 +3779,12 @@
                 customECHDomain: '自定义 ECH 域名',
                 customECHDomainPlaceholder: '例如: cloudflare-ech.com',
                 customECHDomainHint: 'ECH配置中使用的域名，留空则使用默认值',
+                alpn: 'TLS ALPN',
+                alpnDefault: '默认（留空，由客户端协商）',
+                alpnHint: '仅添加到 TLS 节点链接参数；留空则不写 alpn。',
                 saveProtocol: '保存协议配置',
-                subscriptionConverterPlaceholder: '默认: https://api.wcc.best/sub',
-                subscriptionConverterHint: '自定义订阅转换API地址，留空则使用默认地址',
+                subscriptionConverterPlaceholder: '默认: https://url.v1.mk/sub',
+                subscriptionConverterHint: '订阅转换已内部实现，无需外部 API。此项仅作兼容保留，可留空。',
                 builtinPreferredHint: '控制订阅中包含哪些内置优选节点。默认全部启用。',
                 apiEnabledDefault: '默认（关闭API）',
                 apiEnabledYes: '开启API管理',
@@ -2582,7 +3806,7 @@
                     KR: '🇰🇷 韩国', DE: '🇩🇪 德国', SE: '🇸🇪 瑞典', NL: '🇳🇱 荷兰',
                     FI: '🇫🇮 芬兰', GB: '🇬🇧 英国'
                 },
-                terminal: '终端 v2.9.7',
+                terminal: '终端 v2.9.8',
                 githubProject: 'GitHub 项目',
                 autoDetectClient: '自动识别',
                 selectionLogicText: '同地区 → 邻近地区 → 其他地区',
@@ -2682,7 +3906,7 @@
                 enablePreferredDomain: 'فعال‌سازی دامنه ترجیحی',
                 enablePreferredIP: 'فعال‌سازی IP ترجیحی',
                 enableNativeAddress: 'فعال‌سازی آدرس اصلی',
-                enableGitHubPreferred: 'فعال‌سازی ترجیح پیش‌فرض GitHub',
+                enableGitHubPreferred: 'فعال‌سازی ترجیح سفارشی',
                 allowAPIManagement: 'اجازه مدیریت API (ae):',
                 regionMatching: 'تطبیق منطقه (rm):',
                 downgradeControl: 'کنترل کاهش سطح (qj):',
@@ -2698,9 +3922,12 @@
                 trojanPasswordPlaceholder: 'خالی بگذارید تا از UUID استفاده شود',
                 trojanPasswordHint: 'رمز عبور Trojan سفارشی را تنظیم کنید. اگر خالی بگذارید از UUID استفاده می‌شود. کلاینت به طور خودکار رمز عبور را با SHA224 هش می‌کند.',
                 protocolHint: 'می‌توانید چندین پروتکل را همزمان فعال کنید. اشتراک گره‌های پروتکل‌های انتخاب شده را تولید می‌کند.<br>• VLESS WS: پروتکل استاندارد مبتنی بر WebSocket<br>• Trojan: احراز هویت با رمز عبور SHA224<br>• xhttp: پروتکل استتار مبتنی بر HTTP POST (نیاز به اتصال دامنه سفارشی و فعال‌سازی gRPC دارد)',
+                alpn: 'TLS ALPN',
+                alpnDefault: 'پیش‌فرض (خالی، مذاکره توسط کلاینت)',
+                alpnHint: 'فقط به لینک‌های TLS اضافه می‌شود؛ اگر خالی باشد alpn نوشته نمی‌شود.',
                 saveProtocol: 'ذخیره تنظیمات پروتکل',
-                subscriptionConverterPlaceholder: 'پیش‌فرض: https://api.wcc.best/sub',
-                subscriptionConverterHint: 'آدرس API تبدیل اشتراک سفارشی، اگر خالی بگذارید از آدرس پیش‌فرض استفاده می‌شود',
+                subscriptionConverterPlaceholder: 'پیش‌فرض: https://url.v1.mk/sub',
+                subscriptionConverterHint: 'تبدیل اشتراک به صورت داخلی پیاده‌سازی شده است و نیازی به API خارجی ندارد. این فیلد فقط برای سازگاری حفظ شده و می‌توان آن را خالی گذاشت.',
                 builtinPreferredHint: 'کنترل اینکه کدام گره‌های ترجیحی داخلی در اشتراک گنجانده شوند. به طور پیش‌فرض همه فعال هستند.',
                 apiEnabledDefault: 'پیش‌فرض (بستن API)',
                 apiEnabledYes: 'فعال‌سازی مدیریت API',
@@ -2722,7 +3949,7 @@
                     KR: '🇰🇷 کره جنوبی', DE: '🇩🇪 آلمان', SE: '🇸🇪 سوئد', NL: '🇳🇱 هلند',
                     FI: '🇫🇮 فنلاند', GB: '🇬🇧 بریتانیا'
                 },
-                terminal: 'ترمینال v2.9.7',
+                terminal: 'ترمینال v2.9.8',
                 githubProject: 'پروژه GitHub',
                 autoDetectClient: 'تشخیص خودکار',
                 selectionLogicText: 'هم‌منطقه → منطقه مجاور → سایر مناطق',
@@ -3079,6 +4306,69 @@
                 clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
             }
             #languageSelector option { background: var(--cp-bg-2); color: var(--cp-cyan); }
+
+            /* FX toggle - 页面特效图形化开关 */
+            .cp-fx-toggle {
+                position: fixed; top: 68px; left: 22px; z-index: 1001;
+                background: rgba(8,4,28,0.85);
+                border: 1px solid var(--cp-mint);
+                color: var(--cp-mint);
+                padding: 6px 12px;
+                font-family: inherit;
+                font-size: 11px;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+                cursor: pointer;
+                text-shadow: 0 0 6px var(--cp-mint);
+                box-shadow: 0 0 10px rgba(0,255,157,0.35);
+                clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px);
+                transition: all 0.2s ease;
+                display: inline-flex; align-items: center; gap: 6px;
+            }
+            .cp-fx-toggle:hover {
+                color: var(--cp-pink);
+                border-color: var(--cp-pink);
+                text-shadow: 0 0 8px var(--cp-pink);
+                box-shadow: 0 0 16px rgba(255,43,214,0.55);
+            }
+            .cp-fx-toggle .cp-fx-dot {
+                width: 6px; height: 6px;
+                background: var(--cp-mint);
+                border-radius: 50%;
+                box-shadow: 0 0 8px var(--cp-mint);
+                transition: all 0.2s;
+            }
+            body.fx-off .cp-fx-toggle {
+                color: var(--cp-text-dim);
+                border-color: var(--cp-text-dim);
+                text-shadow: none;
+                box-shadow: none;
+            }
+            body.fx-off .cp-fx-toggle .cp-fx-dot {
+                background: transparent;
+                border: 1px solid var(--cp-text-dim);
+                box-shadow: none;
+            }
+            /* FX OFF: 关闭所有装饰性特效，保留布局和配色 */
+            body.fx-off .matrix-bg,
+            body.fx-off .matrix-code-rain,
+            body.fx-off .matrix-column { display: none !important; }
+            body.fx-off::before,
+            body.fx-off::after { display: none !important; content: none !important; }
+            body.fx-off { background: var(--cp-bg) !important; }
+            body.fx-off * {
+                animation: none !important;
+                transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s !important;
+            }
+            body.fx-off .cp-glitch::before,
+            body.fx-off .cp-glitch::after { display: none !important; }
+            body.fx-off .terminal-cursor::after,
+            body.fx-off .cp-fab-save .cp-fab-dot { animation: none !important; }
+            body.fx-off .cp-fab-save:hover { transform: none !important; }
+            body.fx-off .cp-action-bar.cp-dirty::before { animation: none !important; }
+            body.fx-off .header::before { display: none !important; }
+            body.fx-off .card { backdrop-filter: none !important; }
+            body.fx-off select, body.fx-off input, body.fx-off textarea { backdrop-filter: none !important; }
 
             /* Status panel inside card */
             #systemStatus {
@@ -3634,6 +4924,10 @@
                     <option value="fa" ${isFarsi ? 'selected' : ''}>🇮🇷 فارسی</option>
                 </select>
             </div>
+            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="cpToggleFx()" title="${isFarsi ? 'تغییر افکت‌های صفحه' : '切换页面特效'}" aria-label="FX toggle">
+                <span class="cp-fx-dot" aria-hidden="true"></span>
+                <span id="cpFxLabel">FX: ON</span>
+            </button>
         <div class="container">
             <div class="header">
                     <h1 class="title cp-glitch" data-text="${t.title}">${t.title}</h1>
@@ -3732,6 +5026,19 @@
                                         <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-size: 0.95rem;">${t.customECHDomain}</label>
                                         <input type="text" id="customECHDomain" placeholder="${t.customECHDomainPlaceholder}" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 13px;">
                                         <small style="color: #7aa9c4; font-size: 0.8rem; display: block; margin-top: 5px;">${t.customECHDomainHint}</small>
+                                    </div>
+                                    <div style="margin-bottom: 10px;">
+                                        <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-size: 0.95rem;">${t.alpn}</label>
+                                        <select id="alpn" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 13px;">
+                                            <option value="">${t.alpnDefault}</option>
+                                            <option value="h3">h3</option>
+                                            <option value="h2">h2</option>
+                                            <option value="http/1.1">http/1.1</option>
+                                            <option value="h3,h2">h3,h2</option>
+                                            <option value="h2,http/1.1">h2,http/1.1</option>
+                                            <option value="h3,h2,http/1.1">h3,h2,http/1.1</option>
+                                        </select>
+                                        <small style="color: #7aa9c4; font-size: 0.8rem; display: block; margin-top: 5px;">${t.alpnHint}</small>
                                     </div>
                                 </div>
                                 <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(0, 240, 255, 0.3);">
@@ -4216,21 +5523,18 @@
                         });
                     }
                 } else {
-                    // 检查 ECH 是否开启
-                    var echEnabled = document.getElementById('ech') && document.getElementById('ech').checked;
+                    // 统一走内部订阅转换 (?target=xxx)，不再依赖外部 sub-converter
+                    finalUrl = subscriptionUrl + (subscriptionUrl.includes('?') ? '&' : '?') + "target=" + clientType;
+                    var urlElement = document.getElementById("clientSubscriptionUrl");
+                    urlElement.textContent = finalUrl;
+                    urlElement.style.display = "block";
+                    urlElement.style.overflowWrap = "break-word";
+                    urlElement.style.wordBreak = "break-all";
+                    urlElement.style.overflowX = "auto";
+                    urlElement.style.maxWidth = "100%";
+                    urlElement.style.boxSizing = "border-box";
 
-                    // 如果 ECH 开启且是 Clash，直接使用后端接口
-                    if (echEnabled && clientType === atob('Y2xhc2g=')) {
-                        finalUrl = subscriptionUrl + "?target=" + clientType;
-                        var urlElement = document.getElementById("clientSubscriptionUrl");
-                        urlElement.textContent = finalUrl;
-                        urlElement.style.display = "block";
-                        urlElement.style.overflowWrap = "break-word";
-                        urlElement.style.wordBreak = "break-all";
-                        urlElement.style.overflowX = "auto";
-                        urlElement.style.maxWidth = "100%";
-                        urlElement.style.boxSizing = "border-box";
-
+                    if (clientType === atob('Y2xhc2g=')) {
                         if (clientName === 'STASH') {
                             schemeUrl = 'stash://install?url=' + encodeURIComponent(finalUrl);
                             displayName = 'STASH';
@@ -4238,69 +5542,65 @@
                             schemeUrl = 'clash://install-config?url=' + encodeURIComponent(finalUrl);
                             displayName = 'CLASH';
                         }
+                    } else if (clientType === atob('c3VyZ2U=')) {
+                        schemeUrl = 'surge:///install-config?url=' + encodeURIComponent(finalUrl);
+                        displayName = 'SURGE';
+                    } else if (clientType === atob('c2luZ2JveA==')) {
+                        schemeUrl = 'sing-box://install-config?url=' + encodeURIComponent(finalUrl);
+                        displayName = 'SING-BOX';
+                    } else if (clientType === atob('bG9vbg==')) {
+                        schemeUrl = 'loon://install?url=' + encodeURIComponent(finalUrl);
+                        displayName = 'LOON';
+                    } else if (clientType === atob('cXVhbng=')) {
+                        schemeUrl = 'quantumult-x://install-config?url=' + encodeURIComponent(finalUrl);
+                        displayName = 'QUANTUMULT X';
+                    }
 
-                        if (schemeUrl) {
-                            tryOpenApp(schemeUrl, function() {
-                                navigator.clipboard.writeText(finalUrl).then(function() {
-                                    cpToast(displayName + " " + t.subscriptionCopied, 'success');
-                                });
-                            });
-                        } else {
-                            navigator.clipboard.writeText(finalUrl).then(function() {
-                                    cpToast(displayName + " " + t.subscriptionCopied, 'success');
-                            });
-                        }
-                    } else {
-                        // 其他情况使用订阅转换服务
-                        var encodedUrl = encodeURIComponent(subscriptionUrl);
-                        finalUrl = SUB_CONVERTER_URL + "?target=" + clientType + "&url=" + encodedUrl + "&insert=false&config=" + encodeURIComponent(REMOTE_CONFIG_URL) + "&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true";
-                        var urlElement = document.getElementById("clientSubscriptionUrl");
-                        urlElement.textContent = finalUrl;
-                        urlElement.style.display = "block";
-                        urlElement.style.overflowWrap = "break-word";
-                        urlElement.style.wordBreak = "break-all";
-                        urlElement.style.overflowX = "auto";
-                        urlElement.style.maxWidth = "100%";
-                        urlElement.style.boxSizing = "border-box";
-
-                        if (clientType === atob('Y2xhc2g=')) {
-                            if (clientName === 'STASH') {
-                                schemeUrl = 'stash://install?url=' + encodeURIComponent(finalUrl);
-                                displayName = 'STASH';
-                            } else {
-                                schemeUrl = 'clash://install-config?url=' + encodeURIComponent(finalUrl);
-                                displayName = 'CLASH';
-                            }
-                        } else if (clientType === atob('c3VyZ2U=')) {
-                            schemeUrl = 'surge:///install-config?url=' + encodeURIComponent(finalUrl);
-                            displayName = 'SURGE';
-                        } else if (clientType === atob('c2luZ2JveA==')) {
-                            schemeUrl = 'sing-box://install-config?url=' + encodeURIComponent(finalUrl);
-                            displayName = 'SING-BOX';
-                        } else if (clientType === atob('bG9vbg==')) {
-                            schemeUrl = 'loon://install?url=' + encodeURIComponent(finalUrl);
-                            displayName = 'LOON';
-                        } else if (clientType === atob('cXVhbng=')) {
-                            schemeUrl = 'quantumult-x://install-config?url=' + encodeURIComponent(finalUrl);
-                            displayName = 'QUANTUMULT X';
-                        }
-                        
-                        if (schemeUrl) {
-                            tryOpenApp(schemeUrl, function() {
-                                navigator.clipboard.writeText(finalUrl).then(function() {
-                                    cpToast(displayName + " " + t.subscriptionCopied, 'success');
-                                });
-                            });
-                        } else {
+                    if (schemeUrl) {
+                        tryOpenApp(schemeUrl, function() {
                             navigator.clipboard.writeText(finalUrl).then(function() {
                                 cpToast(displayName + " " + t.subscriptionCopied, 'success');
                             });
-                        }
+                        });
+                    } else {
+                        navigator.clipboard.writeText(finalUrl).then(function() {
+                            cpToast(displayName + " " + t.subscriptionCopied, 'success');
+                        });
                     }
                 }
             }
 
+            // 页面特效图形化开关 (localStorage 持久化)
+            window.cpApplyFx = function() {
+                var off = localStorage.getItem('cp-fx-off') === '1';
+                document.body.classList.toggle('fx-off', off);
+                var lbl = document.getElementById('cpFxLabel');
+                if (lbl) lbl.textContent = off ? 'FX: OFF' : 'FX: ON';
+                if (off) {
+                    var rain = document.getElementById('matrixCodeRain');
+                    if (rain) rain.innerHTML = '';
+                } else if (typeof createMatrixRain === 'function') {
+                    var r = document.getElementById('matrixCodeRain');
+                    if (r && !r.firstChild) createMatrixRain();
+                }
+            };
+            window.cpToggleFx = function() {
+                var off = localStorage.getItem('cp-fx-off') === '1';
+                localStorage.setItem('cp-fx-off', off ? '0' : '1');
+                window.cpApplyFx();
+            };
+            (function() {
+                if (localStorage.getItem('cp-fx-off') === '1') {
+                    document.addEventListener('DOMContentLoaded', function() {
+                        document.body.classList.add('fx-off');
+                        var lbl = document.getElementById('cpFxLabel');
+                        if (lbl) lbl.textContent = 'FX: OFF';
+                    });
+                }
+            })();
+
             function createMatrixRain() {
+                if (document.body && document.body.classList.contains('fx-off')) return;
                 const matrixContainer = document.getElementById('matrixCodeRain');
                 if (!matrixContainer) return;
                 const cyberChars = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ$%#@!?<>+=ABCDEF';
@@ -4776,6 +6076,9 @@
                     if (document.getElementById('customECHDomain')) {
                         document.getElementById('customECHDomain').value = config.customECHDomain || '';
                     }
+                    if (document.getElementById('alpn')) {
+                        document.getElementById('alpn').value = config.alpn || '';
+                    }
                     document.getElementById('scu').value = config.scu || '';
                     document.getElementById('ena').checked = config.ena === 'yes';
                     document.getElementById('epd').checked = config.epd !== 'no';
@@ -4946,7 +6249,8 @@
                                 dkby: '',
                                 yxby: '', ev: '', et: '', ex: '', tp: '', scu: '', epd: '', epi: '', egi: '',
                                 ipv4: '', ipv6: '', ispMobile: '', ispUnicom: '', ispTelecom: '',
-                                homepage: ''
+                                homepage: '',
+                                alpn: ''
                             })
                         });
 
@@ -5075,6 +6379,7 @@
                         tp: val('tp'),
                         customDNS: val('customDNS'),
                         customECHDomain: val('customECHDomain'),
+                        alpn: val('alpn'),
                         d: val('customPath'),
                         p: val('customIP'),
                         yx: val('yx'),
@@ -5903,23 +7208,24 @@
     }
 
     async function parseTrojanHeader(buffer, ut) {
+        const bytes = toUint8Array(buffer);
         const passwordToHash = tp || ut;
         const sha224Password = await sha224Hash(passwordToHash);
 
-        if (buffer.byteLength < 56) {
+        if (bytes.byteLength < 56) {
             return {
                 hasError: true,
                 message: "invalid " + atob('dHJvamFu') + " data - too short"
             };
         }
         let crLfIndex = 56;
-        if (new Uint8Array(buffer.slice(56, 57))[0] !== 0x0d || new Uint8Array(buffer.slice(57, 58))[0] !== 0x0a) {
+        if (bytes[56] !== 0x0d || bytes[57] !== 0x0a) {
             return {
                 hasError: true,
                 message: "invalid " + atob('dHJvamFu') + " header format (missing CR LF)"
             };
         }
-        const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
+        const password = sharedDecoder.decode(bytes.subarray(0, crLfIndex));
         if (password !== sha224Password) {
             return {
                 hasError: true,
@@ -5927,7 +7233,7 @@
             };
         }
 
-        const socks5DataBuffer = buffer.slice(crLfIndex + 2);
+        const socks5DataBuffer = bytes.subarray(crLfIndex + 2);
         if (socks5DataBuffer.byteLength < 6) {
             return {
                 hasError: true,
@@ -5935,7 +7241,7 @@
             };
         }
 
-        const view = new DataView(socks5DataBuffer);
+        const view = new DataView(socks5DataBuffer.buffer, socks5DataBuffer.byteOffset, socks5DataBuffer.byteLength);
         const cmd = view.getUint8(0);
         if (cmd !== 1) {
             return {
@@ -5951,22 +7257,16 @@
         switch (atype) {
             case 1:
                 addressLength = 4;
-                address = new Uint8Array(
-                socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)
-                ).join(".");
+                address = socks5DataBuffer.subarray(addressIndex, addressIndex + addressLength).join(".");
                 break;
             case 3:
-                addressLength = new Uint8Array(
-                socks5DataBuffer.slice(addressIndex, addressIndex + 1)
-                )[0];
+                addressLength = socks5DataBuffer[addressIndex];
                 addressIndex += 1;
-                address = new TextDecoder().decode(
-                socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)
-                );
+                address = sharedDecoder.decode(socks5DataBuffer.subarray(addressIndex, addressIndex + addressLength));
                 break;
             case 4:
                 addressLength = 16;
-                const dataView = new DataView(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
+                const dataView = new DataView(socks5DataBuffer.buffer, socks5DataBuffer.byteOffset + addressIndex, addressLength);
                 const ipv6 = [];
                 for (let i = 0; i < 8; i++) {
                     ipv6.push(dataView.getUint16(i * 2).toString(16));
@@ -5988,8 +7288,7 @@
         }
 
         const portIndex = addressIndex + addressLength;
-        const portBuffer = socks5DataBuffer.slice(portIndex, portIndex + 2);
-        const portRemote = new DataView(portBuffer).getUint16(0);
+        const portRemote = new DataView(socks5DataBuffer.buffer, socks5DataBuffer.byteOffset + portIndex, 2).getUint16(0);
 
         return {
             hasError: false,
@@ -5997,7 +7296,7 @@
             addressType: atype,
             port: portRemote,
             hostname: address,
-            rawClientData: socks5DataBuffer.slice(portIndex + 4)
+            rawClientData: socks5DataBuffer.subarray(portIndex + 4)
         };
     }
 
@@ -6573,57 +7872,49 @@
         }
     }
 
-    function generateLinksFromNewIPs(list, user, workerDomain, echConfig = null, skipNumbering = false) {
+    function generateLinksFromNewIPs(list, user, workerDomain, echConfig = null, skipNumbering = false, aliasNamer = null) {
         const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
         const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
         const links = [];
         const wsPath = '/?ed=2048';
         const proto = atob('dmxlc3M=');
 
-        const { namer, setSkipNumbering } = createNodeNamer(skipNumbering);
+        const makeNodeName = aliasNamer || createCompactNodeNamer(skipNumbering);
 
         for (const item of list) {
-            const nodeNameBase = item.name.replace(/\s/g, '_');
             const port = item.port;
             const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
-            const getNodeName = (suffix) => {
-                const nodeName = `${nodeNameBase}-${port}${suffix}`;
-                if (skipNumbering) return nodeName;
-                return namer(nodeNameBase, nodeName);
-            };
-
             if (CF_HTTPS_PORTS.includes(port)) {
-                const suffix = '-WS-TLS';
-                const wsNodeName = getNodeName(suffix);
+                const wsNodeName = makeNodeName(item);
                 let link = `${proto}://${user}@${safeIP}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=${enableECH ? 'chrome' : 'randomized'}&type=ws&host=${workerDomain}&path=${wsPath}`;
+                if (customALPN) link += `&alpn=${encodeURIComponent(customALPN)}`;
 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
                 if (enableECH) {
                     const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                     const echDomain = customECHDomain || 'cloudflare-ech.com';
-                    link += `&alpn=h3&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+                    link += `&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
                 }
 
                 link += `#${encodeURIComponent(wsNodeName)}`;
                 links.push(link);
             } else if (CF_HTTP_PORTS.includes(port)) {
                 if (!disableNonTLS) {
-                    const suffix = '-WS';
-                    const wsNodeName = getNodeName(suffix);
+                    const wsNodeName = makeNodeName(item);
                     const link = `${proto}://${user}@${safeIP}:${port}?encryption=none&security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
                     links.push(link);
                 }
             } else {
-                const suffix = '-WS-TLS';
-                const wsNodeName = getNodeName(suffix);
+                const wsNodeName = makeNodeName(item);
                 let link = `${proto}://${user}@${safeIP}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=${enableECH ? 'chrome' : 'randomized'}&type=ws&host=${workerDomain}&path=${wsPath}`;
+                if (customALPN) link += `&alpn=${encodeURIComponent(customALPN)}`;
 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
                 if (enableECH) {
                     const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                     const echDomain = customECHDomain || 'cloudflare-ech.com';
-                    link += `&alpn=h3&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+                    link += `&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
                 }
 
                 link += `#${encodeURIComponent(wsNodeName)}`;
@@ -6633,28 +7924,16 @@
         return links;
     }
 
-    function generateXhttpLinksFromSource(list, user, workerDomain, echConfig = null, skipNumbering = false) {
+    function generateXhttpLinksFromSource(list, user, workerDomain, echConfig = null, skipNumbering = false, aliasNamer = null) {
         const links = [];
         const nodePath = user.substring(0, 8);
 
-        const { namer, setSkipNumbering } = createNodeNamer(skipNumbering);
+        const makeNodeName = aliasNamer || createCompactNodeNamer(skipNumbering);
 
         for (const item of list) {
-            let nodeNameBase = item.isp || item.name || item.ip;
-            if (!nodeNameBase) continue;
-            nodeNameBase = nodeNameBase.replace(/\s/g, '_');
-            if (item.colo) nodeNameBase = `${nodeNameBase}-${item.colo}`;
             const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
             const port = item.port || 443;
-
-            const getNodeName = (suffix) => {
-                const nodeName = `${nodeNameBase}-${port}${suffix}`;
-                if (skipNumbering) return nodeName;
-                return namer(nodeNameBase, nodeName);
-            };
-
-            const suffix = '-xhttp';
-            const wsNodeName = getNodeName(suffix);
+            const wsNodeName = makeNodeName(item);
 
             const params = new URLSearchParams({
                 encryption: 'none',
@@ -6666,11 +7945,11 @@
                 path: `/${nodePath}`,
                 mode: 'stream-one'
             });
+            applyALPNParam(params);
 
             if (enableECH) {
                 const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                 const echDomain = customECHDomain || 'cloudflare-ech.com';
-                params.set('alpn', 'h3,h2');
                 params.set('ech', `${echDomain}+${dnsServer}`);
             }
 
@@ -6679,7 +7958,7 @@
         return links;
     }
 
-    async function generateTrojanLinksFromNewIPs(list, user, workerDomain, echConfig = null, skipNumbering = false) {
+    async function generateTrojanLinksFromNewIPs(list, user, workerDomain, echConfig = null, skipNumbering = false, aliasNamer = null) {
         const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
         const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 
@@ -6688,50 +7967,42 @@
 
         const password = tp || user;
 
-        const { namer, setSkipNumbering } = createNodeNamer(skipNumbering);
+        const makeNodeName = aliasNamer || createCompactNodeNamer(skipNumbering);
 
         for (const item of list) {
-            const nodeNameBase = item.name.replace(/\s/g, '_');
             const port = item.port;
             const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
-            const getNodeName = (suffix) => {
-                const nodeName = `${nodeNameBase}-${port}${suffix}`;
-                if (skipNumbering) return nodeName;
-                return namer(nodeNameBase, nodeName);
-            };
-
             if (CF_HTTPS_PORTS.includes(port)) {
-                const suffix = `-${atob('VHJvamFu')}-WS-TLS`;
-                const wsNodeName = getNodeName(suffix);
+                const wsNodeName = makeNodeName(item);
                 let link = `${atob('dHJvamFuOi8v')}${password}@${safeIP}:${port}?security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}`;
+                if (customALPN) link += `&alpn=${encodeURIComponent(customALPN)}`;
 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
                 if (enableECH) {
                     const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                     const echDomain = customECHDomain || 'cloudflare-ech.com';
-                    link += `&alpn=h3&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+                    link += `&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
                 }
 
                 link += `#${encodeURIComponent(wsNodeName)}`;
                 links.push(link);
             } else if (CF_HTTP_PORTS.includes(port)) {
                 if (!disableNonTLS) {
-                    const suffix = `-${atob('VHJvamFu')}-WS`;
-                    const wsNodeName = getNodeName(suffix);
+                    const wsNodeName = makeNodeName(item);
                     const link = `${atob('dHJvamFuOi8v')}${password}@${safeIP}:${port}?security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
                     links.push(link);
                 }
             } else {
-                const suffix = `-${atob('VHJvamFu')}-WS-TLS`;
-                const wsNodeName = getNodeName(suffix);
+                const wsNodeName = makeNodeName(item);
                 let link = `${atob('dHJvamFuOi8v')}${password}@${safeIP}:${port}?security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}`;
+                if (customALPN) link += `&alpn=${encodeURIComponent(customALPN)}`;
 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
                 if (enableECH) {
                     const dnsServer = customDNS || 'https://223.5.5.5/dns-query';
                     const echDomain = customECHDomain || 'cloudflare-ech.com';
-                    link += `&alpn=h3&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+                    link += `&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
                 }
                 link += `#${encodeURIComponent(wsNodeName)}`;
                 links.push(link);
@@ -7054,7 +8325,7 @@
             ev = true;
         }
 
-        scu = getConfigValue('scu', '') || 'https://api.wcc.best/sub';
+        scu = getConfigValue('scu', '') || 'https://url.v1.mk/sub';
 
         const preferredDomainsControl = getConfigValue('epd', 'no');
         if (preferredDomainsControl !== undefined && preferredDomainsControl !== '') {
@@ -7095,6 +8366,8 @@
         } else {
             customECHDomain = 'cloudflare-ech.com';
         }
+
+        customALPN = normalizeALPN(getConfigValue('alpn', ''));
 
         // 如果启用了ECH，自动启用仅TLS模式（避免80端口干扰）
         // ECH需要TLS才能工作，所以必须禁用非TLS节点
