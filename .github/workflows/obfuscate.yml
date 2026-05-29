@@ -8,6 +8,7 @@ on:
     paths:
       - 'cfnew.js'
       - 'edgetunnel.js'
+      - 'ech.js'
 
 # 添加写入权限，解决 git push 报错 exit code 128
 permissions:
@@ -42,7 +43,7 @@ jobs:
           const filesToProcess = [
             { source: 'cfnew.js', output: 'cfnew_worker.js' },
             { source: 'edgetunnel.js', output: 'edgetunnel_worker.js' },
-            { source: 'snippets.js', output: 'snippets_worker.js' }
+            { source: 'ech.js', output: 'ech_worker.js' }
           ];
 
           const obfuscationOptions = {
