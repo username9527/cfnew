@@ -107,7 +107,7 @@ jobs:
         run: |
           git config --global user.name 'GitHub Actions Bot'
           git config --global user.email 'github-actions[bot]@github.com'
-          git add 'cfnew_worker.js' 'edgetunnel_worker.js'
+          git add 'cfnew_worker.js' 'edgetunnel_worker.js' 'ech_worker.js'
           if git diff --staged --quiet; then
             echo "No changes to commit, the obfuscated files are already up-to-date."
           else
